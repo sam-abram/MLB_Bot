@@ -45,4 +45,4 @@ defense_cols = ['fielder_2', 'fielder_3', 'fielder_4', 'fielder_5', 'fielder_6',
 final_df[defense_cols] = final_df[defense_cols].fillna(0).astype(int)
 
 print(final_df.head())
-# final_df.to_csv('mlb_pa_data_defense.csv', index=False)
+final_df.to_csv('mlb_pa_data_defense.csv', index=False)

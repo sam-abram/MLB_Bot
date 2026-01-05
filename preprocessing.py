@@ -6,7 +6,7 @@ import numpy as np
 # --- SETUP: LOAD DATA ---
 # If continuing directly from the previous script, assume 'final_df' exists.
 # If loading from a file, uncomment the line below:
-# final_df = pd.read_csv('mlb_pa_data_defense.csv')
+final_df = pd.read_csv('mlb_pa_data_defense.csv')
 
 print(f"Original Row Count: {len(final_df)}")
 
