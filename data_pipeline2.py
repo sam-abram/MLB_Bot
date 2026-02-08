@@ -1,6 +1,4 @@
-
 #!/usr/bin/env python3
-
 from __future__ import annotations
 
 import os
@@ -23,10 +21,13 @@ except ImportError as e:
 # =========================
 # Config (edit these)
 # =========================
-START_DT = "2024-03-28"   # inclusive, YYYY-MM-DD
-END_DT = "2024-09-29"     # inclusive, YYYY-MM-DD
-CHUNK_DAYS = 7           # inclusive chunk length (default ~31)
-OUTPUT_CSV = "test5_statcast_pitch_level.csv"
+START_DT = "2023-03-30"   # inclusive, YYYY-MM-DD
+END_DT = "2025-09-28"     # inclusive, YYYY-MM-DD
+CHUNK_DAYS = 7            # inclusive chunk length
+# data_pipeline2.py (top config)
+OUTPUT_CSV = "statcast_pitches.csv"
+
+OUTPUT_PA_CSV = "test9_statcast_pa_level.csv"  # new: optional convenience output
 # =========================
 
 
@@ -54,14 +55,10 @@ def _daterange_chunks(start_dt: str, end_dt: str, chunk_days: int) -> List[Tuple
 
 
 def _download_statcast_chunk(start_dt: str, end_dt: str, max_retries: int = 4, sleep_s: float = 3.0) -> pd.DataFrame:
-    """
-    Download a chunk with a small retry loop to be resilient to transient network issues.
-    """
     last_err: Optional[BaseException] = None
     for attempt in range(1, max_retries + 1):
         try:
             df = statcast(start_dt=start_dt, end_dt=end_dt)
-            # Ensure pandas DataFrame
             if df is None:
                 return pd.DataFrame()
             return df
@@ -82,46 +79,37 @@ def _first_present(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 
 
 def _coerce_int_id_series(s: pd.Series) -> pd.Series:
-    # Coerce to numeric, fill missing with 0, cast to int
     return pd.to_numeric(s, errors="coerce").fillna(0).astype("int64")
 
 
 def _build_output_columns(df: pd.DataFrame) -> List[str]:
-    """
-    Build columns in the required group order.
-    Include only columns that exist in df, except derived columns that should exist once computed.
-    """
-    # (1) identifiers
     id_cols = [
         "game_date",
         "game_pk",
         "at_bat_number",
         "pitch_number",
-        "pitch_number_in_pa",  # derived
-        "pa_id",               # derived
+        "pitch_number_in_pa",
+        "pa_pitch_count",
+        "is_last_pitch_of_pa",
+        "pa_id",
     ]
+    label_cols = ["pa_outcome"]
 
-    # (2) label
-    label_cols = ["pa_outcome"]  # derived (after merge)
+    player_cols = ["batter", "batter_id", "pitcher", "pitcher_id", "stand", "p_throws", "stadium_id"]
 
-    # (3) player identity
-    player_cols = ["batter", "pitcher", "stand", "p_throws"]
 
-    # (4) stadium/park: first available OR park_proxy_home_team
+
     park_candidates = ["park", "park_id", "stadium", "venue_name"]
     park_col = _first_present(df, park_candidates)
     park_cols: List[str] = []
     if park_col is not None:
         park_cols = [park_col]
     else:
-        # if none exist but home_team exists, write park_proxy_home_team and not home_team
         if "park_proxy_home_team" in df.columns:
             park_cols = ["park_proxy_home_team"]
 
-    # (5) optional defense fielder_2..fielder_9
     defense_cols = [f"fielder_{i}" for i in range(2, 10) if f"fielder_{i}" in df.columns]
 
-    # (6) pre-pitch state / game situation
     situation_cols = [
         "balls",
         "strikes",
@@ -130,14 +118,13 @@ def _build_output_columns(df: pd.DataFrame) -> List[str]:
         "inning_topbot",
         "bat_score",
         "fld_score",
-        "score_diff_bat_minus_fld",  # derived when scores exist
-        "base_1b_occupied",          # derived when on_1b exists
-        "base_2b_occupied",          # derived when on_2b exists
-        "base_3b_occupied",          # derived when on_3b exists
-        "pitcher_game_pitch_count",  # derived when pitcher/game_pk exist
+        "score_diff_bat_minus_fld",
+        "base_1b_occupied",
+        "base_2b_occupied",
+        "base_3b_occupied",
+        "pitcher_game_pitch_count",
     ]
 
-    # (7) observed pitch characteristics
     pitch_char_cols_base = [
         "pitch_type",
         "release_speed",
@@ -157,26 +144,15 @@ def _build_output_columns(df: pd.DataFrame) -> List[str]:
         "sz_bot",
     ]
 
-    # plus any extra strike-zone bound fields
     extra_sz_cols = [
         c for c in df.columns
         if (c.startswith("sz_") or ("strike_zone" in c))
         and c not in pitch_char_cols_base
     ]
-
     pitch_char_cols = pitch_char_cols_base + extra_sz_cols
 
-    # (8) observed pitch result fields
-    pitch_result_cols = [
-        "description",
-        "type",
-        "bb_type",
-        "hit_location",
-        "outs_on_play",
-        "des",
-    ]
+    pitch_result_cols = ["description", "type", "bb_type", "hit_location", "outs_on_play", "des"]
 
-    # (9) observed batted-ball fields
     batted_ball_cols_base = [
         "launch_speed",
         "launch_angle",
@@ -189,7 +165,6 @@ def _build_output_columns(df: pd.DataFrame) -> List[str]:
     estimated_cols = [c for c in df.columns if c.startswith("estimated_")]
     batted_ball_cols = batted_ball_cols_base + estimated_cols
 
-    # Build ordered list, include only if present
     ordered_groups = (
         id_cols
         + label_cols
@@ -202,68 +177,52 @@ def _build_output_columns(df: pd.DataFrame) -> List[str]:
         + batted_ball_cols
     )
 
-    # Derived columns should exist; otherwise, include only if present.
     derived_always = {
-    "pa_id",
-    "pa_outcome",
-    "pitch_number_in_pa",
-    "pa_pitch_count",
-    "is_last_pitch_of_pa",
+        "pa_id",
+        "pa_outcome",
+        "pitch_number_in_pa",
+        "pa_pitch_count",
+        "is_last_pitch_of_pa",
     }
-    derived_conditional = {"score_diff_bat_minus_fld", "pitcher_game_pitch_count",
-                           "base_1b_occupied", "base_2b_occupied", "base_3b_occupied"}
+    derived_conditional = {
+        "score_diff_bat_minus_fld",
+        "pitcher_game_pitch_count",
+        "base_1b_occupied",
+        "base_2b_occupied",
+        "base_3b_occupied",
+    }
 
     out_cols: List[str] = []
     for c in ordered_groups:
         if c in df.columns:
             out_cols.append(c)
         elif c in derived_always:
-            # should exist after derivation; include anyway (will KeyError if missing => signals bug)
             out_cols.append(c)
         elif c in derived_conditional:
-            # include only if computed (i.e., exists in df)
-            # (already handled by c in df.columns)
-            continue
-        else:
             continue
 
-    # Ensure helper columns never leak
     forbidden = {"_row_order", "on_1b", "on_2b", "on_3b"}
     out_cols = [c for c in out_cols if c not in forbidden]
 
-    # De-duplicate while preserving order
     seen = set()
     out_cols_unique: List[str] = []
     for c in out_cols:
         if c not in seen:
             seen.add(c)
             out_cols_unique.append(c)
-
     return out_cols_unique
 
 
 def _process_chunk(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
-    """
-    Process one chunk:
-      - stable ordering + helper _row_order
-      - pa_id, pitch_number_in_pa, pitcher_game_pitch_count
-      - base occupancy flags (and ensure raw runner IDs not output)
-      - score_diff_bat_minus_fld
-      - pa_outcome via last terminal events row per PA, then drop unlabeled PAs
-    Returns processed df and count of dropped rows due to missing pa_outcome.
-    """
     if df is None or df.empty:
         return pd.DataFrame(), 0
 
-    # Stable deterministic tie-breaker
     df = df.copy()
     df["_row_order"] = np.arange(len(df), dtype=np.int64)
 
-    # Require identifiers for PA construction
     if "game_pk" not in df.columns or "at_bat_number" not in df.columns:
         raise KeyError("Downloaded dataframe missing required columns: game_pk and/or at_bat_number")
 
-    # Sort (stable) as specified, using _row_order to break ties deterministically
     if "pitch_number" in df.columns:
         df = df.sort_values(
             by=["game_pk", "at_bat_number", "pitch_number", "_row_order"],
@@ -277,27 +236,15 @@ def _process_chunk(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
             na_position="last",
         )
 
-    # Vectorized pa_id = game_pk|at_bat_number
     df["pa_id"] = df["game_pk"].astype("int64").astype(str) + "|" + df["at_bat_number"].astype("int64").astype(str)
 
-    # pitch_number_in_pa logic
-    # Always define as 1..N within the PA (do NOT use Statcast's game-level pitch_number here)
     df["pitch_number_in_pa"] = (df.groupby("pa_id", sort=False).cumcount() + 1).astype("int64")
-    # How many pitches were in this PA (known only after PA ends; DO NOT use as a feature downstream)
-    df["pa_pitch_count"] = (
-        df.groupby("pa_id", sort=False)["pitch_number_in_pa"].transform("max").astype("int64")
-    )
-
-    # Whether this pitch ended the PA (known only after PA ends; DO NOT use as a feature downstream)
+    df["pa_pitch_count"] = df.groupby("pa_id", sort=False)["pitch_number_in_pa"].transform("max").astype("int64")
     df["is_last_pitch_of_pa"] = (df["pitch_number_in_pa"] == df["pa_pitch_count"]).astype("int8")
 
-    # pitcher_game_pitch_count
     if "game_pk" in df.columns and "pitcher" in df.columns:
-        df["pitcher_game_pitch_count"] = (
-            df.groupby(["game_pk", "pitcher"], sort=False).cumcount() + 1
-        ).astype("int64")
+        df["pitcher_game_pitch_count"] = (df.groupby(["game_pk", "pitcher"], sort=False).cumcount() + 1).astype("int64")
 
-    # Base occupancy flags (0/1 ints) when source columns exist
     if "on_1b" in df.columns:
         df["base_1b_occupied"] = df["on_1b"].notna().astype("int64")
     if "on_2b" in df.columns:
@@ -305,29 +252,36 @@ def _process_chunk(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
     if "on_3b" in df.columns:
         df["base_3b_occupied"] = df["on_3b"].notna().astype("int64")
 
-    # score_diff_bat_minus_fld
     if "bat_score" in df.columns and "fld_score" in df.columns:
         bat = pd.to_numeric(df["bat_score"], errors="coerce")
         fld = pd.to_numeric(df["fld_score"], errors="coerce")
         df["score_diff_bat_minus_fld"] = bat - fld
 
-    # Park proxy if needed: if none of park/park_id/stadium/venue_name exist but home_team exists
     if _first_present(df, ["park", "park_id", "stadium", "venue_name"]) is None and "home_team" in df.columns:
         df["park_proxy_home_team"] = df["home_team"]
-        # ensure original home_team is not written (we'll exclude it in selection)
+    # Stable stadium identifier for downstream modeling
+    park_candidates = ["park", "park_id", "stadium", "venue_name", "park_proxy_home_team"]
+    park_col = _first_present(df, park_candidates)
+    if park_col is None:
+        df["stadium_id"] = "__UNK__"
+    else:
+        df["stadium_id"] = df[park_col].astype("string").fillna("__UNK__").replace("", "__UNK__")
 
-    # Optional defense coercion: fielder_2..fielder_9 if present
     for i in range(2, 10):
         c = f"fielder_{i}"
         if c in df.columns:
             df[c] = _coerce_int_id_series(df[c])
+            # Add standardized id column names expected by preprocessing2.py
+    if "batter_id" not in df.columns and "batter" in df.columns:
+        df["batter_id"] = _coerce_int_id_series(df["batter"])
+    if "pitcher_id" not in df.columns and "pitcher" in df.columns:
+        df["pitcher_id"] = _coerce_int_id_series(df["pitcher"])
 
-    # pa_outcome: terminal events label per PA
+
     if "events" in df.columns:
         out_ev = df["events"].astype("string")
         ev_norm = out_ev.str.lower().fillna("")
 
-        # Filter out common non-PA-ending events so they don't become PA labels
         non_pa = (
             ev_norm.str.startswith("pickoff")
             | ev_norm.str.contains("caught_stealing")
@@ -340,48 +294,100 @@ def _process_chunk(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
             df.loc[df["events"].notna() & ~non_pa, ["pa_id", "pitch_number_in_pa", "_row_order", "events"]]
             .sort_values(["pa_id", "pitch_number_in_pa", "_row_order"], kind="mergesort")
             .drop_duplicates(subset=["pa_id"], keep="last")
-            [["pa_id", "events"]]                      # <- keep only what you need to merge
+            [["pa_id", "events"]]
             .rename(columns={"events": "pa_outcome"})
         )
 
         df = df.merge(outcomes, on="pa_id", how="left")
-
     else:
-        # No events column => cannot label; will drop all rows
         df["pa_outcome"] = pd.NA
 
     before = len(df)
     df = df.loc[df["pa_outcome"].notna()].copy()
     dropped = before - len(df)
 
-    # Never allow helper columns to remain in final output
-    # (We'll also exclude them during column selection, but drop here for safety.)
     if "_row_order" in df.columns:
         df = df.drop(columns=["_row_order"])
 
-    # Ensure runner ID columns are never output
     for c in ["on_1b", "on_2b", "on_3b"]:
-        # keep them in df if you want for debugging? Requirement says never written; not necessarily drop.
-        # We'll drop to reduce accidental leakage.
         if c in df.columns:
             df = df.drop(columns=[c])
 
     return df, dropped
 
 
+def _build_pa_rows_from_pitch_chunk(df_proc: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build 1 row per PA (for convenience; preprocessing does full PA dataset creation anyway).
+
+    Columns:
+      - game_date, pa_id, batter_id, pitcher_id, stadium_id, pitcher_fatigue, pa_outcome
+    """
+    if df_proc is None or df_proc.empty:
+        return pd.DataFrame()
+
+    df = df_proc
+    if "pitch_number_in_pa" not in df.columns:
+        return pd.DataFrame()
+
+    first = df.loc[df["pitch_number_in_pa"] == 1].copy()
+    if first.empty:
+        return pd.DataFrame()
+
+    # Dedup within chunk (safety)
+    if "pa_id" in first.columns:
+        first = first.drop_duplicates(subset=["pa_id"], keep="first")
+
+    # Stadium extraction
+    # Stadium extraction
+    park_candidates = ["stadium_id", "park", "park_id", "stadium", "venue_name", "park_proxy_home_team"]
+    park_col = _first_present(first, park_candidates)
+    if park_col is None:
+        first["stadium_id"] = "__UNK__"
+    else:
+        first["stadium_id"] = first[park_col].astype("string").fillna("__UNK__").replace("", "__UNK__")
+
+
+    # Fatigue at PA start = pitches thrown before first pitch of this PA
+    if "pitcher_game_pitch_count" in first.columns:
+        ppc = pd.to_numeric(first["pitcher_game_pitch_count"], errors="coerce").fillna(0).astype("int64")
+        first["pitcher_fatigue"] = (ppc - 1).clip(lower=0).astype("int64")
+    else:
+        first["pitcher_fatigue"] = 0
+
+    bat_col = "batter_id" if "batter_id" in first.columns else ("batter" if "batter" in first.columns else None)
+    pit_col = "pitcher_id" if "pitcher_id" in first.columns else ("pitcher" if "pitcher" in first.columns else None)
+    if bat_col is None or pit_col is None:
+        raise ValueError(
+            f"Missing batter/pitcher id columns for PA output. Need one of "
+            f"batter/batter_id and pitcher/pitcher_id. Found columns: {sorted(first.columns.tolist())}"
+        )
+    first["batter_id"] = pd.to_numeric(first[bat_col], errors="coerce").fillna(0).astype("int64")
+    first["pitcher_id"] = pd.to_numeric(first[pit_col], errors="coerce").fillna(0).astype("int64")
+
+
+    out = first[["game_date", "pa_id", "batter_id", "pitcher_id", "stadium_id", "pitcher_fatigue", "pa_outcome"]].copy()
+    return out
+
+
 def main() -> int:
     os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_CSV)) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(OUTPUT_PA_CSV)) or ".", exist_ok=True)
 
     chunks = _daterange_chunks(START_DT, END_DT, CHUNK_DAYS)
 
     total_chunks = 0
     total_written = 0
+    total_pa_written = 0
     total_dropped_unlabeled = 0
 
     wrote_header = False
+    wrote_pa_header = False
     header_cols: Optional[List[str]] = None
+    pa_header_cols: Optional[List[str]] = None
 
-    print(f"Output: {OUTPUT_CSV}")
+    print(f"Pitch-level output: {OUTPUT_CSV}")
+    print(f"PA-level output:    {OUTPUT_PA_CSV}")
     print(f"Date range: {START_DT} to {END_DT} (inclusive)")
     print(f"Chunk size: {CHUNK_DAYS} days (inclusive)\n")
 
@@ -405,32 +411,36 @@ def main() -> int:
             print(f"  -> No rows to write for this chunk.\n")
             continue
 
-        # Build columns to write for this chunk
         chunk_cols = _build_output_columns(df_proc)
 
-        # Establish output schema from FIRST written chunk to keep a valid single CSV.
-        # If later chunks are missing some of these columns, we create them as NA to match the header.
         if not wrote_header:
             header_cols = chunk_cols
         else:
             assert header_cols is not None
-            # Add any missing header columns as NA (only those already in the established schema).
             for c in header_cols:
                 if c not in df_proc.columns:
                     df_proc[c] = pd.NA
-            # If the chunk has extra columns not in the header schema, ignore them.
             chunk_cols = header_cols
 
-        # Ensure correct order and no accidental helper columns
         df_out = df_proc.loc[:, chunk_cols].copy()
-
         mode = "w" if not wrote_header else "a"
         df_out.to_csv(OUTPUT_CSV, mode=mode, header=(not wrote_header), index=False)
-
         wrote_header = True
         total_written += len(df_out)
 
-        print(f"  -> Wrote {len(df_out):,} rows ({'with header' if mode=='w' else 'appended'})\n")
+        # PA-level optional output
+        df_pa = _build_pa_rows_from_pitch_chunk(df_proc)
+        if not df_pa.empty:
+            pa_cols = ["game_date", "pa_id", "batter_id", "pitcher_id", "stadium_id", "pitcher_fatigue", "pa_outcome"]
+            if not wrote_pa_header:
+                pa_header_cols = pa_cols
+            df_pa.to_csv(OUTPUT_PA_CSV, mode=("w" if not wrote_pa_header else "a"),
+                         header=(not wrote_pa_header), index=False)
+            wrote_pa_header = True
+            total_pa_written += len(df_pa)
+
+        print(f"  -> Wrote pitch rows: {len(df_out):,} ({'with header' if mode=='w' else 'appended'})")
+        print(f"  -> Wrote PA rows:    {len(df_pa):,}\n")
 
     if not wrote_header:
         print("No output written (no data returned for the given date range).")
@@ -441,6 +451,7 @@ def main() -> int:
     print("======== Summary ========")
     print(f"Total chunks processed: {total_chunks}")
     print(f"Total pitch rows written: {total_written:,}")
+    print(f"Total PA rows written:    {total_pa_written:,}")
     print(f"Total pitch rows dropped due to unlabeled PAs: {total_dropped_unlabeled:,}")
     print(f"Total columns written: {len(header_cols)}")
     print("=========================")
@@ -452,4 +463,3 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit("\nInterrupted.")
-

@@ -28,9 +28,9 @@ import pandas as pd
 # Configuration constants
 # =========================
 
-INPUT_CSV = "statcast_pitch_level.csv"
+INPUT_CSV = "test5_statcast_pitch_level.csv"
 READ_CHUNK_ROWS = 500_000
-OUTPUT_DIR = "preprocessed"
+OUTPUT_DIR = "preprocessed_test5"
 
 # Prefer parquet, but fall back safely if not available
 OUTPUT_FORMAT = "parquet"  # "parquet" or "csv.gz" (auto-fallback if parquet unavailable)
@@ -47,7 +47,7 @@ TRAIN_FRAC = 0.80
 VAL_FRAC = 0.10
 TEST_FRAC = 0.10  # must sum to 1.0 if using fractions
 
-MIN_LABEL_COUNT = 200
+MIN_LABEL_COUNT = 20
 RANDOM_SEED = 1337
 
 WRITE_METADATA_JSON = True
@@ -90,8 +90,10 @@ RAW_TO_CANON_LABEL = {
     "sac_bunt": "SAC",
 }
 
-UNRECOGNIZED_LABEL_BUCKET = "OTHER_RAW"
-RARE_LABEL_BUCKET = "OTHER"  # after rare-label handling on train
+# Unknown/unrecognized outcomes and rare outcomes both go to the same final bucket.
+UNRECOGNIZED_LABEL_BUCKET = "OTHER"
+RARE_LABEL_BUCKET = "OTHER"
+
 
 # =========================
 # Feature selection rules
@@ -141,7 +143,13 @@ POST_PITCH_EXCLUDE = {
 ALWAYS_EXCLUDE = {
     "pa_outcome",
     "label",
+
+    # These are post-PA knowledge (leakage). Keep for weighting/debug only, never as features.
+    "pa_pitch_count",
+    "is_last_pitch_of_pa",
+    "pa_example_weight",
 }
+
 
 # Any columns starting with this prefix:
 ESTIMATED_PREFIX = "estimated_"
@@ -158,7 +166,30 @@ ID_LIKE_INT_COLS = [
     "at_bat_number",
     "batter",
     "pitcher",
+    # defense (Statcast fielders)
+    "fielder_2",
+    "fielder_3",
+    "fielder_4",
+    "fielder_5",
+    "fielder_6",
+    "fielder_7",
+    "fielder_8",
+    "fielder_9",
 ]
+
+NUMERIC_ID_CATEGORICALS = {
+    "batter",
+    "pitcher",
+    "fielder_2",
+    "fielder_3",
+    "fielder_4",
+    "fielder_5",
+    "fielder_6",
+    "fielder_7",
+    "fielder_8",
+    "fielder_9",
+}
+
 
 # Count/state fields to coerce to integer if present (missing -> 0)
 STATE_INT_COLS = [
@@ -300,9 +331,27 @@ def _coerce_many_float(df: pd.DataFrame, cols: Iterable[str]) -> None:
 
 def _map_labels(pa_outcome: pd.Series) -> pd.Series:
     raw = _normalize_str_series(pa_outcome)
-    # Treat empty as missing -> will be dropped later
-    mapped = raw.map(RAW_TO_CANON_LABEL).fillna(UNRECOGNIZED_LABEL_BUCKET)
+
+    # Empty stays empty (dropped later as "missing label")
+    mapped = raw.map(RAW_TO_CANON_LABEL)
+
+    # Many Statcast "events" strings represent outs but may not be enumerated above.
+    # If it looks like an out/double-play/triple-play, force it into INPLAY_OUT.
+    unknown = mapped.isna() & (raw != "")
+    out_like = unknown & (
+        raw.str.endswith("out")
+        | raw.str.contains("double_play", regex=False)
+        | raw.str.contains("triple_play", regex=False)
+        | raw.str.contains("field_out", regex=False)
+        | raw.str.contains("force_out", regex=False)
+        | raw.str.contains("grounded_into_double_play", regex=False)
+    )
+    mapped = mapped.where(~out_like, "INPLAY_OUT")
+
+    # Anything still unknown becomes OTHER
+    mapped = mapped.fillna(UNRECOGNIZED_LABEL_BUCKET)
     return mapped
+
 
 def _feature_mode_exclusions(columns: List[str]) -> set:
     cols = set(columns)
@@ -558,9 +607,14 @@ def build_feature_plan(header_cols: List[str]) -> Tuple[List[str], List[str], Li
     # Identify raw categoricals present (we'll encode to *_id)
     raw_cats = [c for c in CATEGORICAL_COLS_CANDIDATES if c in cols]
     # batter/pitcher treated as categorical IDs for embeddings (encoded)
-    for c in ["batter", "pitcher"]:
-        if c in cols and c not in raw_cats:
+    for c in (
+        "batter", "pitcher",
+        "fielder_2", "fielder_3", "fielder_4", "fielder_5",
+        "fielder_6", "fielder_7", "fielder_8", "fielder_9",
+    ):
+        if c in cols and c not in raw_cats and c not in exclusions and c not in ALWAYS_EXCLUDE:
             raw_cats.append(c)
+
 
     # Int features present
     int_cols = [c for c in (STATE_INT_COLS + ID_LIKE_INT_COLS) if c in cols]
@@ -575,7 +629,21 @@ def build_feature_plan(header_cols: List[str]) -> Tuple[List[str], List[str], Li
     # (We still coerce unknown continuous columns to float only if you add them.)
 
     # Passthrough (non-feature) columns we keep for trace/debug in outputs
-    passthrough = [c for c in ["game_date", "pa_id", "pitch_number_in_pa", "game_pk"] if c in cols]
+    # Passthrough (non-feature) columns we keep for trace/debug in outputs.
+# pa_example_weight is derived here (not present in raw input), so we append it explicitly.
+    passthrough = [c for c in [
+        "game_date",
+        "pa_id",
+        "pitch_number_in_pa",
+        "game_pk",
+        "pa_pitch_count",
+        "is_last_pitch_of_pa",
+    ] if c in cols]
+
+    # derived later in preprocess_chunk_base()
+    if "pa_example_weight" not in passthrough:
+        passthrough.append("pa_example_weight")
+
 
     # Derived columns we may add if inputs exist
     derived = [
@@ -706,10 +774,26 @@ def preprocess_chunk_base(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int
     df["runners_on"] = (df["on_1b_flag"] + df["on_2b_flag"] + df["on_3b_flag"]).astype("int8")
 
     # Derived: is_first_pitch_of_pa
+    # Derived: is_first_pitch_of_pa
     if "pitch_number_in_pa" in df.columns:
         df["is_first_pitch_of_pa"] = (df["pitch_number_in_pa"] == 1).astype("int8")
     else:
         df["is_first_pitch_of_pa"] = 0
+
+    # Leakage helpers (kept for weighting/debug only; excluded from features via ALWAYS_EXCLUDE)
+    if "pa_pitch_count" in df.columns:
+        df["pa_pitch_count"] = pd.to_numeric(df["pa_pitch_count"], errors="coerce").fillna(0).astype("int64")
+    else:
+        df["pa_pitch_count"] = 0
+
+    if "is_last_pitch_of_pa" in df.columns:
+        df["is_last_pitch_of_pa"] = pd.to_numeric(df["is_last_pitch_of_pa"], errors="coerce").fillna(0).astype("int8")
+    else:
+        df["is_last_pitch_of_pa"] = 0
+
+    # Weight each pitch so every PA contributes total weight ~= 1 (prevents long PAs from dominating)
+    pc = df["pa_pitch_count"].clip(lower=1).astype("float32")
+    df["pa_example_weight"] = (1.0 / pc).astype("float32")
 
     # Derived: abs_score_diff
     if "score_diff_bat_minus_fld" in df.columns:
@@ -718,6 +802,7 @@ def preprocess_chunk_base(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int
         df["abs_score_diff"] = np.nan
 
     return df, drop_counts
+
 
 def pass2_fit_train_stats(
     input_csv: str,
@@ -791,11 +876,14 @@ def pass2_fit_train_stats(
             if c not in df_train.columns:
                 continue
             # Special: batter/pitcher are ints -> treat as categorical IDs via string
-            if c in ("batter", "pitcher"):
-                s = df_train[c].astype("int64").astype("string")
-                s = s.fillna("").str.strip()
-                # do not lower numeric strings
-                s_norm = s
+            # Special: numeric-id entity columns are ints -> treat as categorical IDs via string
+            # (batter, pitcher, and optionally fielders)
+            if c in NUMERIC_ID_CATEGORICALS:
+                # 0 is our missing sentinel for entity IDs (batter/pitcher/fielders).
+                # Keep it as PAD ("") rather than a real token like "0".
+                s_int = pd.to_numeric(df_train[c], errors="coerce").fillna(0).astype("int64")
+                s_int = s_int.where(s_int != 0, pd.NA)
+                s_norm = s_int.astype("Int64").astype("string").fillna("").str.strip()
             else:
                 s_norm = _normalize_str_series(df_train[c])
 
@@ -864,12 +952,15 @@ def pass2_fit_train_stats(
 
     # Choose int features: provided + derived (exclude ids we encode separately? we keep batter/pitcher ints out and use *_id)
     int_feature_cols = []
+    SKIP_INT_FEATURES = set(NUMERIC_ID_CATEGORICALS) | {"game_pk", "at_bat_number"}
+
+
     for c in int_cols:
-        if c in ("batter", "pitcher"):
+        if c in SKIP_INT_FEATURES:
             continue
-        if c in ALWAYS_EXCLUDE or c in exclusions:
-            continue
-        int_feature_cols.append(c)
+        if c not in exclusions and c not in ALWAYS_EXCLUDE:
+            int_feature_cols.append(c)
+
     for c in derived_ints:
         int_feature_cols.append(c)
     # also include pitch_number_in_pa already in STATE_INT_COLS but is useful as feature; kept above.
@@ -930,8 +1021,10 @@ def _encode_categorical_series(s: pd.Series, vocab: Dict[str, int], treat_as_num
     Vectorized mapping.
     """
     if treat_as_numeric_id:
-        # s is expected to be integer-like (already coerced)
-        s_norm = s.astype("int64").astype("string").fillna("").str.strip()
+        # Entity-ID categoricals (batter/pitcher/...): 0 is missing/PAD.
+        s_int = pd.to_numeric(s, errors="coerce").fillna(0).astype("int64")
+        s_int = s_int.where(s_int != 0, pd.NA)
+        s_norm = s_int.astype("Int64").astype("string").fillna("").str.strip()
     else:
         s_norm = _normalize_str_series(s)
 
@@ -952,6 +1045,8 @@ def _enforce_output_dtypes(
     int_cols: List[str],
     derived_int8_cols: List[str],
 ) -> pd.DataFrame:
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
     for c in numeric_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
@@ -1004,10 +1099,21 @@ def pass3_transform_and_write(
     # Output columns: passthrough + label + features
     # Keep game_date for trace and to confirm split logic.
     base_cols = []
-    for c in ["game_date", "pa_id", "pitch_number_in_pa", "game_pk"]:
+    for c in [
+        "game_date",
+        "pa_id",
+        "pitch_number_in_pa",
+        "game_pk",
+        "pa_pitch_count",
+        "is_last_pitch_of_pa",
+        "pa_example_weight",
+    ]:
         if c in passthrough_cols and c not in base_cols:
             base_cols.append(c)
+
     out_cols = base_cols + ["label"] + fit.feature_list
+    seen = set()
+    out_cols = [c for c in out_cols if not (c in seen or seen.add(c))]
 
     writers = {
         "train": SplitWriter(OUTPUT_DIR, output_format, "train", out_cols),
@@ -1070,6 +1176,9 @@ def pass3_transform_and_write(
         # Rare-label remap (based on train counts only)
         df["label"] = df["label"].mask(df["label"].isin(rare_set), RARE_LABEL_BUCKET)
 
+        final_set = set(fit.final_labels)
+        df["label"] = df["label"].where(df["label"].isin(final_set), RARE_LABEL_BUCKET)
+
         # Ensure required int features exist; fill if missing
         for c in int_cols:
             if c not in df.columns:
@@ -1100,7 +1209,7 @@ def pass3_transform_and_write(
                 # create PAD-only
                 df[f"{raw_c}_id"] = 0
                 continue
-            treat_as_id = raw_c in ("batter", "pitcher")
+            treat_as_id = raw_c in NUMERIC_ID_CATEGORICALS
             # For batter/pitcher, ensure int coercion first
             if treat_as_id:
                 _coerce_int(df, raw_c, fill=0, dtype="int64")

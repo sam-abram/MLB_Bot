@@ -1,0 +1,80 @@
+{
+  "PREPROCESSED_DIR": "preprocessed",
+  "ARTIFACT_DIR": "model_artifacts",
+  "BATCH_SIZE": 4096,
+  "NUM_EPOCHS": 100,
+  "LEARNING_RATE": 0.0003,
+  "WEIGHT_DECAY": 0.01,
+  "EMBED_DIM_DEFAULT": 16,
+  "HIDDEN_DIMS": [
+    256,
+    128
+  ],
+  "DROPOUT": 0.2,
+  "EARLY_STOP_PATIENCE": 8,
+  "DEVICE": "cpu",
+  "NUM_WORKERS": 0,
+  "MAX_TRAIN_ROWS": null,
+  "TARGET_COL": "y",
+  "WEIGHT_COL": "pa_example_weight",
+  "weights_used": false,
+  "use_class_weights": false,
+  "USE_EMBEDDING_INTERACTIONS": false,
+  "BATTER_EMBED_DIM": 32,
+  "PITCHER_EMBED_DIM": 32,
+  "STADIUM_EMBED_DIM": 16,
+  "HANDEDNESS_EMBED_DIM": 4,
+  "resolved": {
+    "file_format": "parquet",
+    "split_paths": {
+      "train": "preprocessed\\train.parquet",
+      "val": "preprocessed\\val.parquet",
+      "test": "preprocessed\\test.parquet"
+    },
+    "feature_list_ordered": [
+      "batter_id",
+      "pitcher_id",
+      "stadium_id",
+      "stand",
+      "p_throws",
+      "pitcher_fatigue"
+    ],
+    "categorical_cols": [
+      "batter_id",
+      "pitcher_id",
+      "stadium_id",
+      "stand",
+      "p_throws"
+    ],
+    "numeric_cols": [
+      "pitcher_fatigue"
+    ],
+    "categorical_vocab_sizes": {
+      "batter_id": 1961,
+      "pitcher_id": 1716,
+      "stadium_id": 32,
+      "stand": 4,
+      "p_throws": 4
+    },
+    "embedding_dims": {
+      "batter_id": 32,
+      "pitcher_id": 32,
+      "stadium_id": 16,
+      "stand": 4,
+      "p_throws": 4
+    },
+    "num_classes": 6,
+    "label_set_ordered": [
+      "K",
+      "BIPO",
+      "BB",
+      "1B",
+      "XBH",
+      "HR"
+    ],
+    "tendency_artifact_paths": {},
+    "model_class": "PitchOutcomeModel",
+    "interaction_dim": 0
+  },
+  "timestamp": "2026-02-08 12:07:18"
+}

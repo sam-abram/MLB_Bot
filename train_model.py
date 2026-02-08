@@ -20,7 +20,6 @@ Assumptions:
 """
 
 from __future__ import annotations
-
 import json
 import math
 import os
@@ -39,19 +38,31 @@ from torch.utils.data import DataLoader, IterableDataset
 # -----------------------------
 # Top-of-file configuration constants
 # -----------------------------
-PREPROCESSED_DIR = "preprocessed"
+PREPROCESSED_DIR = "preprocessed_test5"
 ARTIFACT_DIR = "model_artifacts"
 BATCH_SIZE = 4096
-NUM_EPOCHS = 10
+NUM_EPOCHS = 100
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-2
 EMBED_DIM_DEFAULT = 16  # used for _id embeddings unless overridden
 HIDDEN_DIMS = [256, 128]
 DROPOUT = 0.2
-EARLY_STOP_PATIENCE = 2  # stop if val loss doesn’t improve
+EARLY_STOP_PATIENCE = 8  # stop if val loss doesn’t improve
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_WORKERS = 0  # safe default
 MAX_TRAIN_ROWS = None  # optional cap for quick testing
+SEED = 1337
+SHUFFLE_TRAIN_ROWS_WITHIN_BATCH = True
+GRAD_CLIP_NORM = 1.0
+
+# IMPORTANT:
+# - For probability forecasting, do NOT force class balancing by default.
+USE_CLASS_WEIGHTS = False
+
+# Per-example weights written by preprocessing (one row per pitch)
+WEIGHT_COL = "pa_example_weight"
+
+
 
 
 # -----------------------------
@@ -311,6 +322,9 @@ class SplitBatchIterableDataset(IterableDataset):
         label_to_index: Dict[str, int],
         batch_size: int,
         max_rows: Optional[int] = None,
+        shuffle_rows: bool = False,
+        seed: int = 0,
+        weight_col: Optional[str] = None,
     ) -> None:
         super().__init__()
         self.path = path
@@ -321,9 +335,15 @@ class SplitBatchIterableDataset(IterableDataset):
         self.label_to_index = label_to_index
         self.batch_size = int(batch_size)
         self.max_rows = None if max_rows is None else int(max_rows)
+        self.shuffle_rows = bool(shuffle_rows)
+        self._rng = np.random.default_rng(int(seed))
+        self.weight_col = weight_col
 
         # Read only needed columns
         self.columns = list(feature_order) + ["label"]
+        if self.weight_col is not None:
+            self.columns.append(self.weight_col)
+
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         if self.file_format == "parquet":
@@ -359,10 +379,16 @@ class SplitBatchIterableDataset(IterableDataset):
 
             rows_read += len(df)
 
+            if self.shuffle_rows and len(df) > 1:
+                rs = int(self._rng.integers(0, 2**31 - 1))
+                df = df.sample(frac=1.0, random_state=rs).reset_index(drop=True)
+
             out = self._df_to_tensors(df)
             if out is None:
                 continue
+
             yield out
+
 
     def _iter_csv(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         rows_read = 0
@@ -387,27 +413,34 @@ class SplitBatchIterableDataset(IterableDataset):
 
             rows_read += len(df)
 
+            if self.shuffle_rows and len(df) > 1:
+                rs = int(self._rng.integers(0, 2**31 - 1))
+                df = df.sample(frac=1.0, random_state=rs).reset_index(drop=True)
+
             out = self._df_to_tensors(df)
             if out is None:
                 continue
+
             yield out
+
 
     def _df_to_tensors(
         self, df: pd.DataFrame
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        # Map labels via string form to keep deterministic behavior
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         labels_raw = df["label"].astype(str)
         y_idx = labels_raw.map(self.label_to_index)
 
-        # Drop unknown/missing labels defensively
         mask = y_idx.notna()
         if not mask.any():
-            return None
+            raise ValueError(
+                "All labels in this batch are unknown. "
+                "This usually means preprocessing produced labels not in metadata['final_label_set']."
+            )
 
         df2 = df.loc[mask].copy()
         y_idx2 = y_idx.loc[mask].astype(np.int64, copy=False).to_numpy(copy=False)
 
-        # Build x_cat, x_num in the exact feature order partition
+        # Features
         if self.cat_cols:
             cat_arrays = [_safe_series_to_int64(df2[c]) for c in self.cat_cols]
             x_cat_np = np.stack(cat_arrays, axis=1) if len(cat_arrays) > 1 else cat_arrays[0].reshape(-1, 1)
@@ -423,7 +456,16 @@ class SplitBatchIterableDataset(IterableDataset):
             x_num = torch.empty((len(df2), 0), dtype=torch.float32)
 
         y = torch.from_numpy(y_idx2.astype(np.int64, copy=False))
-        return x_cat, x_num, y
+
+        # Weights (default = 1)
+        if self.weight_col is not None and self.weight_col in df2.columns:
+            w_np = pd.to_numeric(df2[self.weight_col], errors="coerce").fillna(1.0).to_numpy(dtype=np.float32, copy=False)
+            w = torch.from_numpy(w_np)
+        else:
+            w = torch.ones((len(df2),), dtype=torch.float32)
+
+        return x_cat, x_num, y, w
+
 
 
 # -----------------------------
@@ -442,6 +484,7 @@ class PitchOutcomeModel(nn.Module):
         super().__init__()
         self.cat_cols = list(cat_cols)
         self.num_numeric = int(num_numeric)
+        self.num_norm = nn.LayerNorm(self.num_numeric) if self.num_numeric > 0 else None
         self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
         self.num_classes = int(num_classes)
 
@@ -492,7 +535,10 @@ class PitchOutcomeModel(nn.Module):
                 parts.append(emb)
 
         if x_num is not None and x_num.numel() > 0:
+            if self.num_norm is not None:
+                x_num = self.num_norm(x_num)
             parts.append(x_num)
+
 
         if parts:
             x = torch.cat(parts, dim=1)
@@ -515,29 +561,37 @@ class EpochMetrics:
 
 
 @torch.no_grad()
+@torch.no_grad()
 def evaluate(
     model: nn.Module,
-    dataset: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    dataset: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     criterion: nn.Module,
     device: str,
 ) -> EpochMetrics:
     model.eval()
-    total_loss = 0.0
+    loss_num = 0.0
+    loss_den = 0.0
     total_correct = 0
     total_n = 0
 
-    for x_cat, x_num, y in dataset:
+    for x_cat, x_num, y, w in dataset:
         if y.numel() == 0:
             continue
+
         x_cat = x_cat.to(device, non_blocking=True)
         x_num = x_num.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        w = w.to(device, non_blocking=True).float()
 
         logits = model(x_cat, x_num)
-        loss = criterion(logits, y)
+        per_ex_loss = criterion(logits, y)  # (N,)
+
+        batch_num = (per_ex_loss * w).sum()
+        batch_den = w.sum().clamp_min(1e-12)
 
         n = int(y.numel())
-        total_loss += float(loss.item()) * n
+        loss_num += float(batch_num.item())
+        loss_den += float(batch_den.item())
         total_correct += int((logits.argmax(dim=1) == y).sum().item())
         total_n += n
 
@@ -545,39 +599,50 @@ def evaluate(
         return EpochMetrics(loss=float("nan"), accuracy=float("nan"), n=0)
 
     return EpochMetrics(
-        loss=total_loss / total_n,
+        loss=(loss_num / max(loss_den, 1e-12)),
         accuracy=total_correct / total_n,
         n=total_n,
     )
 
 
+
 def train_one_epoch(
     model: nn.Module,
-    dataset: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    dataset: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: str,
 ) -> EpochMetrics:
     model.train()
-    total_loss = 0.0
+    loss_num = 0.0
+    loss_den = 0.0
     total_correct = 0
     total_n = 0
 
-    for x_cat, x_num, y in dataset:
+    for x_cat, x_num, y, w in dataset:
         if y.numel() == 0:
             continue
+
         x_cat = x_cat.to(device, non_blocking=True)
         x_num = x_num.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        w = w.to(device, non_blocking=True).float()
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(x_cat, x_num)
-        loss = criterion(logits, y)
+
+        per_ex_loss = criterion(logits, y)  # (N,)
+        batch_num = (per_ex_loss * w).sum()
+        batch_den = w.sum().clamp_min(1e-12)
+        loss = batch_num / batch_den
+
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_NORM)
         optimizer.step()
 
         n = int(y.numel())
-        total_loss += float(loss.item()) * n
+        loss_num += float(batch_num.item())
+        loss_den += float(batch_den.item())
         total_correct += int((logits.argmax(dim=1) == y).sum().item())
         total_n += n
 
@@ -585,17 +650,20 @@ def train_one_epoch(
         return EpochMetrics(loss=float("nan"), accuracy=float("nan"), n=0)
 
     return EpochMetrics(
-        loss=total_loss / total_n,
+        loss=(loss_num / max(loss_den, 1e-12)),
         accuracy=total_correct / total_n,
         n=total_n,
     )
+
 
 
 # -----------------------------
 # Main
 # -----------------------------
 def main() -> None:
-    meta_path = os.path.join(PREPROCESSED_DIR, "metadata.json")
+    pre_dir = sys.argv[1] if len(sys.argv) > 1 else PREPROCESSED_DIR
+
+    meta_path = os.path.join(pre_dir, "metadata.json")
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"Missing metadata file: {meta_path}")
 
@@ -608,7 +676,6 @@ def main() -> None:
     if not isinstance(feature_order, list) or not feature_order:
         raise ValueError("meta['features']['feature_list_ordered'] must be a non-empty list")
 
-    # Partition features by suffix rule, preserving order
     feature_order = [str(c) for c in feature_order]
     cat_cols = [c for c in feature_order if c.endswith("_id")]
     num_cols = [c for c in feature_order if not c.endswith("_id")]
@@ -617,13 +684,16 @@ def main() -> None:
     label_to_index, index_to_label = _build_label_maps(label_list)
     num_classes = len(label_list)
 
-    file_format, split_paths = _resolve_splits(PREPROCESSED_DIR)
+    file_format, split_paths = _resolve_splits(pre_dir)
+
 
     # Vocab sizes for categorical features
     vocab_sizes = _get_vocab_sizes_from_meta(meta, cat_cols)
 
     # Class weights (required; will raise if metadata missing/incomplete)
-    class_weights = _maybe_class_weights_from_meta(meta, label_list).to(DEVICE)
+    class_weights = None
+    if USE_CLASS_WEIGHTS:
+        class_weights = _maybe_class_weights_from_meta(meta, label_list).to(DEVICE)
 
     # Build datasets (IterableDataset yielding batches)
     train_ds = SplitBatchIterableDataset(
@@ -635,6 +705,8 @@ def main() -> None:
         label_to_index=label_to_index,
         batch_size=BATCH_SIZE,
         max_rows=MAX_TRAIN_ROWS,
+        weight_col=WEIGHT_COL,
+
     )
     val_ds = SplitBatchIterableDataset(
         path=split_paths["val"],
@@ -645,6 +717,8 @@ def main() -> None:
         label_to_index=label_to_index,
         batch_size=BATCH_SIZE,
         max_rows=None,
+        weight_col=WEIGHT_COL,
+
     )
     test_ds = SplitBatchIterableDataset(
         path=split_paths["test"],
@@ -655,6 +729,8 @@ def main() -> None:
         label_to_index=label_to_index,
         batch_size=BATCH_SIZE,
         max_rows=None,
+        weight_col=WEIGHT_COL,
+
     )
 
     # Wrap in DataLoaders (batch_size=None because dataset already yields batches)
@@ -673,7 +749,7 @@ def main() -> None:
         dropout=DROPOUT,
     ).to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, reduction="none")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
     # Summary logging
