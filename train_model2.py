@@ -1637,24 +1637,25 @@ def main() -> None:
         model.load_state_dict(best_state)
 
     test_metrics = evaluate(model, test_loader, criterion, DEVICE)
-        # --- Distribution scorecard (proper probability evaluation) ---
-    # Use WEIGHT_COL for baselines only if it exists in the split (otherwise None)
-    baseline_weight_col = WEIGHT_COL if (WEIGHT_COL in set(split_columns["train"]) and WEIGHT_COL in set(split_columns["test"])) else None
+    # --- Distribution scorecard (proper probability evaluation) ---
+    # Evaluate scorecard on VAL split (the primary evaluation window)
+    baseline_weight_col = WEIGHT_COL if (WEIGHT_COL in set(split_columns["train"]) and WEIGHT_COL in set(split_columns["val"])) else None
 
     scorecard = compute_distribution_scorecard(
         model=model,
         train_path=split_paths["train"],
-        test_path=split_paths["test"],
+        test_path=split_paths["val"],
         file_format=file_format,
         num_classes=num_classes,
-        test_loader=test_loader,
+        test_loader=val_loader,
         device=DEVICE,
         weight_col_for_baselines=baseline_weight_col,
     )
 
+    print("[SCORECARD] Evaluated on VAL split (primary eval window)")
     print("[SCORECARD] Uniform logloss:        {:.6f}".format(scorecard["uniform_logloss"]))
     print("[SCORECARD] Base-rate logloss:      {:.6f}".format(scorecard["base_rate_logloss"]))
-    print("[SCORECARD] Model test logloss:     {:.6f}".format(scorecard["model_test_logloss"]))
+    print("[SCORECARD] Model val logloss:      {:.6f}".format(scorecard["model_test_logloss"]))
     print("[SCORECARD] Delta vs base-rates:     {:+.6f}".format(scorecard["delta_logloss_vs_base_rates"]))
     print("[SCORECARD] % better than base:     {:+.2f}%".format(scorecard["pct_better_than_base_rates"]))
     print("[SCORECARD] Majority-class acc:     {:.4f}".format(scorecard["majority_class_accuracy"]))

@@ -106,8 +106,8 @@ TENDENCY_DIRICHLET_ALPHA = 2.0  # alias for backward compat (old bucket system)
 MEAN_SHRINK_K = 50.0
 
 # Feature toggles for ablation experiments
-ENABLE_SIX_VECTORS = False      # Disabled for embeddings-only experiment
-ENABLE_EMBEDDINGS = True        # Toggle learned embeddings on/off
+ENABLE_SIX_VECTORS = True       # Six-vector interpretable features (42)
+ENABLE_EMBEDDINGS = False       # Disabled for vectors-only experiment
 ENABLE_BUCKET_FEATURES = False  # Set to False to disable bucket-weighted tendency features
 ENABLE_PARK_FACTORS = False     # Set to False to disable park factor features
 

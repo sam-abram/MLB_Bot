@@ -1,0 +1,38 @@
+{
+  "reserved_ids": {
+    "PAD_NA": 0,
+    "UNK": 1
+  },
+  "vocab": {
+    "proxy_home_team:ATH": 2,
+    "proxy_home_team:ATL": 3,
+    "proxy_home_team:AZ": 4,
+    "proxy_home_team:BAL": 5,
+    "proxy_home_team:BOS": 6,
+    "proxy_home_team:CHC": 7,
+    "proxy_home_team:CIN": 8,
+    "proxy_home_team:CLE": 9,
+    "proxy_home_team:COL": 10,
+    "proxy_home_team:CWS": 11,
+    "proxy_home_team:DET": 12,
+    "proxy_home_team:HOU": 13,
+    "proxy_home_team:KC": 14,
+    "proxy_home_team:LAA": 15,
+    "proxy_home_team:LAD": 16,
+    "proxy_home_team:MIA": 17,
+    "proxy_home_team:MIL": 18,
+    "proxy_home_team:MIN": 19,
+    "proxy_home_team:NYM": 20,
+    "proxy_home_team:NYY": 21,
+    "proxy_home_team:PHI": 22,
+    "proxy_home_team:PIT": 23,
+    "proxy_home_team:SD": 24,
+    "proxy_home_team:SEA": 25,
+    "proxy_home_team:SF": 26,
+    "proxy_home_team:STL": 27,
+    "proxy_home_team:TB": 28,
+    "proxy_home_team:TEX": 29,
+    "proxy_home_team:TOR": 30,
+    "proxy_home_team:WSH": 31
+  }
+}

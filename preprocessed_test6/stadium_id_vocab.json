@@ -1,0 +1,38 @@
+{
+  "reserved_ids": {
+    "PAD_NA": 0,
+    "UNK": 1
+  },
+  "vocab": {
+    "ATH": 2,
+    "ATL": 3,
+    "AZ": 4,
+    "BAL": 5,
+    "BOS": 6,
+    "CHC": 7,
+    "CIN": 8,
+    "CLE": 9,
+    "COL": 10,
+    "CWS": 11,
+    "DET": 12,
+    "HOU": 13,
+    "KC": 14,
+    "LAA": 15,
+    "LAD": 16,
+    "MIA": 17,
+    "MIL": 18,
+    "MIN": 19,
+    "NYM": 20,
+    "NYY": 21,
+    "PHI": 22,
+    "PIT": 23,
+    "SD": 24,
+    "SEA": 25,
+    "SF": 26,
+    "STL": 27,
+    "TB": 28,
+    "TEX": 29,
+    "TOR": 30,
+    "WSH": 31
+  }
+}
