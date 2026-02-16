@@ -1180,6 +1180,131 @@ class HybridModel(nn.Module):
         }
 
 
+class StatcastLogitHybridModel(nn.Module):
+    """
+    Logit-space hybrid with pitch-type statcast block fed to embedding head.
+
+    Embedding head input: concat(categorical_embeddings, x_pt)  where x_pt is the 90-col block
+    Vector head: same as before (weighted sum of v1-v6 from the first 43 numeric cols)
+    Combination: a * emb_logits + b * log(vec_probs)
+    """
+
+    def __init__(
+        self,
+        cat_cols: List[str],
+        num_numeric: int,
+        vocab_sizes: Dict[str, int],
+        num_classes: int,
+        hidden_dims: List[int],
+        dropout: float,
+        num_pt_statcast_cols: int = 90,
+    ) -> None:
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+        self.num_classes = int(num_classes)
+        self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
+        self.num_pt_statcast_cols = int(num_pt_statcast_cols)
+
+        # --- Embedding head ---
+        self.embeddings = nn.ModuleDict()
+        self.emb_dims: Dict[str, int] = {}
+        emb_out_dim = 0
+        for col in self.cat_cols:
+            vs = int(vocab_sizes[col])
+            ed = _choose_emb_dim(col, vs)
+            self.emb_dims[col] = ed
+            self.embeddings[col] = nn.Embedding(
+                num_embeddings=vs, embedding_dim=ed, padding_idx=PAD_NA_ID
+            )
+            emb_out_dim += ed
+
+        # LayerNorm for the statcast block before feeding to MLP
+        self.pt_norm = nn.LayerNorm(self.num_pt_statcast_cols)
+
+        # Embedding MLP input: embeddings + statcast block
+        mlp_in = emb_out_dim + self.num_pt_statcast_cols
+        emb_layers: List[nn.Module] = []
+        prev = mlp_in
+        for h in hidden_dims:
+            emb_layers.append(nn.Linear(prev, int(h)))
+            emb_layers.append(nn.ReLU())
+            emb_layers.append(nn.Dropout(float(dropout)))
+            prev = int(h)
+        emb_layers.append(nn.Linear(prev, self.num_classes))
+        self.emb_mlp = nn.Sequential(*emb_layers)
+
+        # --- Vector head (unchanged) ---
+        self.num_vectors = 6
+        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+
+        # --- Combination weights ---
+        self.raw_ab = nn.Parameter(torch.zeros(2))
+
+        print(f"[MODEL] StatcastLogitHybridModel:")
+        print(f"  Embedding head: {self.emb_dims} + {self.num_pt_statcast_cols} statcast cols -> MLP {hidden_dims} -> {self.num_classes}")
+        print(f"  MLP input dim: {mlp_in}")
+        print(f"  Vector head: {self.num_vectors} vectors with log_n weighting (unchanged)")
+        print(f"  Combination: a * emb_logits + b * log(vec_probs)")
+
+    def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor) -> torch.Tensor:
+        # --- Embedding head with statcast block ---
+        emb_parts: List[torch.Tensor] = []
+        for i, col in enumerate(self.cat_cols):
+            ids = torch.clamp(x_cat[:, i], min=0, max=self.vocab_sizes[col] - 1)
+            emb_parts.append(self.embeddings[col](ids))
+
+        # Statcast block: last num_pt_statcast_cols columns of x_num
+        x_pt = x_num[:, -self.num_pt_statcast_cols:]
+        x_pt = self.pt_norm(x_pt)
+
+        emb_input = torch.cat(emb_parts + [x_pt], dim=1)
+        emb_logits = self.emb_mlp(emb_input)
+
+        # --- Vector head (uses first 43 cols, indices unchanged) ---
+        v1 = x_num[:, 1:7]
+        v2 = x_num[:, 8:14]
+        v3 = x_num[:, 15:21]
+        v4 = x_num[:, 22:28]
+        v5 = x_num[:, 29:35]
+        v6 = x_num[:, 36:42]
+
+        vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+
+        log_n = torch.stack([
+            x_num[:, 7], x_num[:, 14], x_num[:, 21],
+            x_num[:, 28], x_num[:, 35], x_num[:, 42],
+        ], dim=1)
+
+        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
+        vec_weights = torch.softmax(adjusted, dim=1)
+        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)
+        vec_logits = torch.log(vec_probs + 1e-8)
+
+        # --- Combine in logit space ---
+        ab = torch.softmax(self.raw_ab, dim=0)
+        combined_logits = ab[0] * emb_logits + ab[1] * vec_logits
+
+        return combined_logits
+
+    def get_learned_weights(self) -> Dict[str, float]:
+        with torch.no_grad():
+            w = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+        return {
+            "v1_batter_overall": float(w[0]),
+            "v2_pitcher_overall": float(w[1]),
+            "v3_stadium": float(w[2]),
+            "v4_batter_platoon": float(w[3]),
+            "v5_pitcher_platoon": float(w[4]),
+            "v6_pitch_mix": float(w[5]),
+        }
+
+    def get_ab_weights(self) -> Dict[str, float]:
+        with torch.no_grad():
+            ab = torch.softmax(self.raw_ab, dim=0).cpu().numpy()
+        return {"a_embedding": float(ab[0]), "b_vector": float(ab[1])}
+
+
 # -----------------------------
 # Training / Evaluation
 # -----------------------------
@@ -1518,7 +1643,17 @@ def compute_distribution_scorecard(
 # Main
 # -----------------------------
 def main() -> None:
-    pre_dir = sys.argv[1] if len(sys.argv) > 1 else PREPROCESSED_DIR
+    import argparse as _argparse
+    _parser = _argparse.ArgumentParser()
+    _parser.add_argument("preprocessed_dir", nargs="?", default=PREPROCESSED_DIR)
+    _parser.add_argument("--use_pitchtype_statcast_block", action="store_true", default=False,
+                         help="Feed 90 pitch-type statcast cols into the embedding head")
+    _parser.add_argument("--artifact_dir", type=str, default=None,
+                         help="Override artifact output directory")
+    _args = _parser.parse_args()
+    pre_dir = _args.preprocessed_dir
+    use_pt_statcast = _args.use_pitchtype_statcast_block
+    artifact_dir = _args.artifact_dir if _args.artifact_dir else ARTIFACT_DIR
 
     # Reproducibility
     np.random.seed(SEED)
@@ -1642,7 +1777,32 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=None, num_workers=NUM_WORKERS)
 
     # Build model
-    if USE_HYBRID_MODEL and len(cat_cols) > 0:
+    # Detect pitch-type statcast columns
+    pt_statcast_cols = [c for c in num_cols if c.startswith("pitcher_pitch_rate_") or
+                        c.startswith("pitcher_FF_") or c.startswith("pitcher_SI_") or
+                        c.startswith("pitcher_FC_") or c.startswith("pitcher_SL_") or
+                        c.startswith("pitcher_CU_") or c.startswith("pitcher_CH_") or
+                        c.startswith("pitcher_FS_") or c.startswith("pitcher_ST_") or
+                        c.startswith("pitcher_SV_") or c.startswith("pitcher_OTHER_") or
+                        c.startswith("batter_FF_") or c.startswith("batter_SI_") or
+                        c.startswith("batter_FC_") or c.startswith("batter_SL_") or
+                        c.startswith("batter_CU_") or c.startswith("batter_CH_") or
+                        c.startswith("batter_FS_") or c.startswith("batter_ST_") or
+                        c.startswith("batter_SV_") or c.startswith("batter_OTHER_")]
+    num_pt_statcast = len(pt_statcast_cols)
+
+    if use_pt_statcast and num_pt_statcast > 0 and len(cat_cols) > 0:
+        print(f"[CONFIG] Using StatcastLogitHybridModel ({num_pt_statcast} statcast cols in embedding head)")
+        model = StatcastLogitHybridModel(
+            cat_cols=cat_cols,
+            num_numeric=len(num_cols),
+            vocab_sizes=vocab_sizes,
+            num_classes=num_classes,
+            hidden_dims=HIDDEN_DIMS,
+            dropout=DROPOUT,
+            num_pt_statcast_cols=num_pt_statcast,
+        ).to(DEVICE)
+    elif USE_HYBRID_MODEL and len(cat_cols) > 0:
         print("[CONFIG] Using hybrid model (embeddings + vectors with learnable a,b)")
         model = HybridModel(
             cat_cols=cat_cols,
@@ -1800,9 +1960,9 @@ def main() -> None:
     print("-" * 72)
 
     # Save artifacts
-    _ensure_dir(ARTIFACT_DIR)
+    _ensure_dir(artifact_dir)
 
-    model_path = os.path.join(ARTIFACT_DIR, "model.pt")
+    model_path = os.path.join(artifact_dir, "model.pt")
     torch.save(model.state_dict(), model_path)
 
     # Preserve tendency artifact paths for downstream inference (if present)
@@ -1815,7 +1975,7 @@ def main() -> None:
     # Train config + resolved lists
     train_config = {
         "PREPROCESSED_DIR": pre_dir,
-        "ARTIFACT_DIR": ARTIFACT_DIR,
+        "ARTIFACT_DIR": artifact_dir,
         "BATCH_SIZE": BATCH_SIZE,
         "NUM_EPOCHS": NUM_EPOCHS,
         "LEARNING_RATE": LEARNING_RATE,
@@ -1847,19 +2007,19 @@ def main() -> None:
             "num_classes": num_classes,
             "label_set_ordered": label_set_ordered,
             "tendency_artifact_paths": tendency_artifact_paths,
-            "model_class": "HybridModel" if USE_HYBRID_MODEL else ("PitchOutcomeModelWithInteractions" if USE_EMBEDDING_INTERACTIONS else "PitchOutcomeModel"),
+            "model_class": type(model).__name__,
             "interaction_dim": BATTER_EMBED_DIM if USE_EMBEDDING_INTERACTIONS else 0,
         },
         "timestamp": _now_str(),
     }
-    _write_json(os.path.join(ARTIFACT_DIR, "train_config.json"), train_config)
+    _write_json(os.path.join(artifact_dir, "train_config.json"), train_config)
 
     # Label maps (consistent with preprocessing2)
-    _write_json(os.path.join(ARTIFACT_DIR, "label_to_index.json"), {k: int(v) for k, v in label_to_index.items()})
-    _write_json(os.path.join(ARTIFACT_DIR, "index_to_label.json"), {str(k): v for k, v in index_to_label.items()})
+    _write_json(os.path.join(artifact_dir, "label_to_index.json"), {k: int(v) for k, v in label_to_index.items()})
+    _write_json(os.path.join(artifact_dir, "index_to_label.json"), {str(k): v for k, v in index_to_label.items()})
 
     # Copy metadata.json used
-    shutil.copy(meta_path, os.path.join(ARTIFACT_DIR, "metadata.json"))
+    shutil.copy(meta_path, os.path.join(artifact_dir, "metadata.json"))
 
     # Metrics
     metrics = {
@@ -1898,11 +2058,67 @@ def main() -> None:
         print("=" * 50 + "\n")
         metrics["hybrid_ab_weights"] = ab_weights
 
-    _write_json(os.path.join(ARTIFACT_DIR, "metrics.json"), metrics)
+    _write_json(os.path.join(artifact_dir, "metrics.json"), metrics)
 
-    print(f"Artifacts saved to: {ARTIFACT_DIR}")
+    print(f"Artifacts saved to: {artifact_dir}")
     print(f"  - {model_path}")
     print("  - train_config.json, label_to_index.json, index_to_label.json, metadata.json, metrics.json")
+
+    # Comparison table (when using pitchtype statcast experiment)
+    if use_pt_statcast:
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        val_ll = scorecard["model_test_logloss"]  # val logloss from scorecard
+        test_ll = float(evaluate_logloss_only(model, test_loader, DEVICE))
+
+        base_val = 1.4438
+        base_test = 1.4724
+        prior = [
+            ("A: Embeddings only",         1.4320, 1.4688, 174_920, 32),
+            ("B: Vector weights",           1.4312, 1.4689,      12,  1),
+            ("C: Hybrid (prob mix)",        1.4311, 1.4719, 174_676, 13),
+            ("D: Hybrid (logit mix)",       1.4307, 1.4695, 174_676, 13),
+        ]
+
+        lines = []
+        sep = "=" * 90
+        hdr = f"  {'Model':<35s} {'Params':>8s} {'Epoch':>6s} {'Val LL':>10s} {'%vsBase':>8s} {'Test LL':>10s} {'%vsBase':>8s}"
+        dash = "-" * 90
+
+        lines.append(sep)
+        lines.append("  COMPARISON TABLE")
+        lines.append(sep)
+        lines.append(hdr)
+        lines.append(dash)
+        for name, vl, tl, params, ep in prior:
+            vp = 100.0 * (base_val - vl) / base_val
+            tp = 100.0 * (base_test - tl) / base_test
+            lines.append(f"  {name:<35s} {params:>8,d} {ep:>6d} {vl:>10.4f} {vp:>+7.2f}% {tl:>10.4f} {tp:>+7.2f}%")
+        # This run
+        vp = 100.0 * (base_val - val_ll) / base_val
+        tp = 100.0 * (base_test - test_ll) / base_test
+        lines.append(f"  {'E: Hybrid + PT Statcast':<35s} {n_params:>8,d} {best_epoch:>6d} {val_ll:>10.4f} {vp:>+7.2f}% {test_ll:>10.4f} {tp:>+7.02f}%")
+        lines.append(dash)
+        lines.append(f"  {'Base rate':<35s} {'--':>8s} {'--':>6s} {base_val:>10.4f} {'--':>8s} {base_test:>10.4f} {'--':>8s}")
+        lines.append(sep)
+
+        table_str = "\n".join(lines)
+        print("\n" + table_str)
+
+        # Save comparison
+        with open(os.path.join(artifact_dir, "comparison.txt"), "w") as f:
+            f.write(table_str + "\n")
+        _write_json(os.path.join(artifact_dir, "comparison.json"), {
+            "models": {
+                "A_embeddings_only": {"val_ll": 1.4320, "test_ll": 1.4688},
+                "B_vector_weights": {"val_ll": 1.4312, "test_ll": 1.4689},
+                "C_hybrid_prob": {"val_ll": 1.4311, "test_ll": 1.4719},
+                "D_hybrid_logit": {"val_ll": 1.4307, "test_ll": 1.4695},
+                "E_hybrid_pt_statcast": {"val_ll": val_ll, "test_ll": test_ll,
+                                         "params": n_params, "best_epoch": best_epoch},
+            },
+            "base_rate": {"val_ll": base_val, "test_ll": base_test},
+        })
+        print(f"\nComparison saved to {artifact_dir}/comparison.txt and comparison.json")
 
 
 if __name__ == "__main__":
