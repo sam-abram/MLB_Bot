@@ -1305,6 +1305,456 @@ class StatcastLogitHybridModel(nn.Module):
         return {"a_embedding": float(ab[0]), "b_vector": float(ab[1])}
 
 
+class ContextualGateLogitHybridModel(nn.Module):
+    """
+    Logit-space hybrid with a matchup-dependent gate g(x) in [0,1]:
+      vec_logits = log(vec_probs + 1e-8)
+      combined_logits = vec_logits + g(x) * (emb_logits - vec_logits)
+
+    Gate features (computed on-the-fly from the PT statcast block):
+      - mean_contact_rate_over_mix: sum_pt pitch_rate_pt * batter_contact_rate_pt
+      - fallback_fraction_over_mix: sum_pt pitch_rate_pt * 1[batter stat was imputed]
+      - pitch_mix_entropy: -sum_pt pitch_rate_pt * log(pitch_rate_pt + eps)
+    """
+
+    def __init__(
+        self,
+        cat_cols: List[str],
+        num_numeric: int,
+        vocab_sizes: Dict[str, int],
+        num_classes: int,
+        hidden_dims: List[int],
+        dropout: float,
+        num_pt_statcast_cols: int = 90,
+        gate_init_g: float = 0.38,
+    ) -> None:
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+        self.num_classes = int(num_classes)
+        self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
+        self.num_pt_statcast_cols = int(num_pt_statcast_cols)
+
+        # Determine per-pitch-type stride and column offsets
+        num_pitch_types = 10
+        self.cols_per_pt = self.num_pt_statcast_cols // num_pitch_types
+        self.num_pitch_types = num_pitch_types
+        # v1: 9 cols/pt (rate, 6 pitcher, 2 batter[ls,la])
+        # v2: 21 cols/pt (rate, 4 pitcher mean, 5 zone, 2 std, 4 shape, 2 spin, 3 batter[ls,la,cr])
+        if self.cols_per_pt == 21:
+            self._contact_offset = 20  # batter_{pt}_contact_rate
+            self._ev_offset = 18       # batter_{pt}_launch_speed
+        else:
+            self._contact_offset = None  # v1 has no contact_rate
+            self._ev_offset = 7          # batter_{pt}_launch_speed in v1
+
+        # --- Embedding head (identical to StatcastLogitHybridModel) ---
+        self.embeddings = nn.ModuleDict()
+        self.emb_dims: Dict[str, int] = {}
+        emb_out_dim = 0
+        for col in self.cat_cols:
+            vs = int(vocab_sizes[col])
+            ed = _choose_emb_dim(col, vs)
+            self.emb_dims[col] = ed
+            self.embeddings[col] = nn.Embedding(
+                num_embeddings=vs, embedding_dim=ed, padding_idx=PAD_NA_ID
+            )
+            emb_out_dim += ed
+
+        self.pt_norm = nn.LayerNorm(self.num_pt_statcast_cols)
+
+        mlp_in = emb_out_dim + self.num_pt_statcast_cols
+        emb_layers: List[nn.Module] = []
+        prev = mlp_in
+        for h in hidden_dims:
+            emb_layers.append(nn.Linear(prev, int(h)))
+            emb_layers.append(nn.ReLU())
+            emb_layers.append(nn.Dropout(float(dropout)))
+            prev = int(h)
+        emb_layers.append(nn.Linear(prev, self.num_classes))
+        self.emb_mlp = nn.Sequential(*emb_layers)
+
+        # --- Vector head (unchanged) ---
+        self.num_vectors = 6
+        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+
+        # --- Contextual gate: 3 features -> scalar in [0,1] ---
+        gate_input_dim = 3
+        self.gate_net = nn.Sequential(
+            nn.Linear(gate_input_dim, 1),
+        )
+        # Initialize bias so sigmoid(bias) ~ gate_init_g, weights small
+        init_bias = math.log(gate_init_g / (1.0 - gate_init_g))
+        with torch.no_grad():
+            self.gate_net[0].weight.fill_(0.0)
+            self.gate_net[0].bias.fill_(init_bias)
+
+        # For tracking gate stats
+        self._last_gate_values: Optional[torch.Tensor] = None
+
+        print(f"[MODEL] ContextualGateLogitHybridModel:")
+        print(f"  Embedding head: {self.emb_dims} + {self.num_pt_statcast_cols} statcast cols -> MLP {hidden_dims} -> {self.num_classes}")
+        print(f"  MLP input dim: {mlp_in}")
+        print(f"  Vector head: {self.num_vectors} vectors with log_n weighting (unchanged)")
+        print(f"  Gate: {gate_input_dim} features -> sigmoid -> g(x)")
+        print(f"  Combination: vec_logits + g(x) * (emb_logits - vec_logits)")
+        print(f"  Gate init bias: {init_bias:.4f} -> sigmoid ~ {gate_init_g:.2f}")
+
+    def _compute_gate_features(self, x_pt: torch.Tensor) -> torch.Tensor:
+        """Compute 3 gate features from the PT statcast block (un-normalized)."""
+        B = x_pt.shape[0]
+        eps = 1e-8
+        stride = self.cols_per_pt
+
+        # Extract pitch rates for each pitch type: shape (B, 10)
+        pitch_rates = torch.stack([x_pt[:, i * stride] for i in range(self.num_pitch_types)], dim=1)
+
+        # 1. mean_contact_rate_over_mix
+        if self._contact_offset is not None:
+            # v2: explicit contact_rate column
+            contact_rates = torch.stack(
+                [x_pt[:, i * stride + self._contact_offset] for i in range(self.num_pitch_types)], dim=1
+            )
+        else:
+            # v1: use (launch_speed > 0) as binary contact proxy
+            ev_vals = torch.stack(
+                [x_pt[:, i * stride + self._ev_offset] for i in range(self.num_pitch_types)], dim=1
+            )
+            contact_rates = (ev_vals > 0).float()
+        mean_contact = (pitch_rates * contact_rates).sum(dim=1, keepdim=True)
+
+        # 2. fallback_fraction_over_mix: fraction of mix where batter stat was imputed (0-filled)
+        ev_vals_for_impute = torch.stack(
+            [x_pt[:, i * stride + self._ev_offset] for i in range(self.num_pitch_types)], dim=1
+        )
+        is_imputed = (ev_vals_for_impute == 0.0).float()
+        fallback_frac = (pitch_rates * is_imputed).sum(dim=1, keepdim=True)
+
+        # 3. pitch_mix_entropy: -sum pitch_rate * log(pitch_rate + eps)
+        entropy = -(pitch_rates * torch.log(pitch_rates + eps)).sum(dim=1, keepdim=True)
+
+        return torch.cat([mean_contact, fallback_frac, entropy], dim=1)  # (B, 3)
+
+    def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor) -> torch.Tensor:
+        # --- Embedding head with statcast block ---
+        emb_parts: List[torch.Tensor] = []
+        for i, col in enumerate(self.cat_cols):
+            ids = torch.clamp(x_cat[:, i], min=0, max=self.vocab_sizes[col] - 1)
+            emb_parts.append(self.embeddings[col](ids))
+
+        x_pt_raw = x_num[:, -self.num_pt_statcast_cols:]
+        x_pt = self.pt_norm(x_pt_raw)
+
+        emb_input = torch.cat(emb_parts + [x_pt], dim=1)
+        emb_logits = self.emb_mlp(emb_input)
+
+        # --- Vector head (uses first 43 cols, indices unchanged) ---
+        v1 = x_num[:, 1:7]
+        v2 = x_num[:, 8:14]
+        v3 = x_num[:, 15:21]
+        v4 = x_num[:, 22:28]
+        v5 = x_num[:, 29:35]
+        v6 = x_num[:, 36:42]
+
+        vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+
+        log_n = torch.stack([
+            x_num[:, 7], x_num[:, 14], x_num[:, 21],
+            x_num[:, 28], x_num[:, 35], x_num[:, 42],
+        ], dim=1)
+
+        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
+        vec_weights = torch.softmax(adjusted, dim=1)
+        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)
+        vec_logits = torch.log(vec_probs + 1e-8)
+
+        # --- Contextual gate ---
+        gate_feats = self._compute_gate_features(x_pt_raw)
+        g = torch.sigmoid(self.gate_net(gate_feats))  # (B, 1)
+        self._last_gate_values = g.detach()
+
+        # combined = vec_logits + g * (emb_logits - vec_logits)
+        combined_logits = vec_logits + g * (emb_logits - vec_logits)
+
+        return combined_logits
+
+    def get_learned_weights(self) -> Dict[str, float]:
+        with torch.no_grad():
+            w = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+        return {
+            "v1_batter_overall": float(w[0]),
+            "v2_pitcher_overall": float(w[1]),
+            "v3_stadium": float(w[2]),
+            "v4_batter_platoon": float(w[3]),
+            "v5_pitcher_platoon": float(w[4]),
+            "v6_pitch_mix": float(w[5]),
+        }
+
+    def get_gate_params(self) -> Dict[str, float]:
+        with torch.no_grad():
+            w = self.gate_net[0].weight.cpu().numpy().flatten()
+            b = self.gate_net[0].bias.cpu().item()
+        return {
+            "gate_weight_contact": float(w[0]),
+            "gate_weight_fallback": float(w[1]),
+            "gate_weight_entropy": float(w[2]),
+            "gate_bias": float(b),
+            "gate_bias_sigmoid": float(1.0 / (1.0 + math.exp(-b))),
+        }
+
+
+def collect_gate_stats(
+    model: nn.Module,
+    dataset,
+    device: str,
+) -> Dict[str, float]:
+    """Collect g(x) summary stats on a dataset split."""
+    model.eval()
+    all_g = []
+    with torch.no_grad():
+        for x_cat, x_num, y, w in dataset:
+            if y.numel() == 0:
+                continue
+            x_cat = x_cat.to(device, non_blocking=True)
+            x_num = x_num.to(device, non_blocking=True)
+            _ = model(x_cat, x_num)
+            if model._last_gate_values is not None:
+                all_g.append(model._last_gate_values.cpu())
+    if not all_g:
+        return {}
+    g_all = torch.cat(all_g, dim=0).squeeze()
+    g_np = g_all.numpy()
+    return {
+        "mean": float(g_np.mean()),
+        "std": float(g_np.std()),
+        "min": float(g_np.min()),
+        "max": float(g_np.max()),
+        "p5": float(np.percentile(g_np, 5)),
+        "p25": float(np.percentile(g_np, 25)),
+        "p50": float(np.percentile(g_np, 50)),
+        "p75": float(np.percentile(g_np, 75)),
+        "p95": float(np.percentile(g_np, 95)),
+    }
+
+
+class PerClassGateLogitHybridModel(nn.Module):
+    """
+    Logit-space hybrid with a per-class contextual gate g_k(x):
+      delta = emb_logits - vec_logits                # (B, 6)
+      g = sigmoid(gate_net(features))                # (B, 6)
+      combined_logits = vec_logits + g * delta        # elementwise
+
+    Gate features (computed from expert disagreement):
+      - abs_delta:  |emb_logits - vec_logits|        # 6 dims
+      - ent_vec:    entropy(softmax(vec_logits))      # 1 dim
+      - ent_emb:    entropy(softmax(emb_logits))      # 1 dim
+      - delta_l2:   sqrt(mean(delta^2))              # 1 dim
+    Total gate input: 9 dims -> Linear(9,16) -> ReLU -> Linear(16,6) -> sigmoid
+    """
+
+    def __init__(
+        self,
+        cat_cols: List[str],
+        num_numeric: int,
+        vocab_sizes: Dict[str, int],
+        num_classes: int,
+        hidden_dims: List[int],
+        dropout: float,
+        num_pt_statcast_cols: int = 90,
+        gate_init_g: float = 0.326,
+    ) -> None:
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+        self.num_classes = int(num_classes)
+        self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
+        self.num_pt_statcast_cols = int(num_pt_statcast_cols)
+
+        # --- Embedding head (identical to StatcastLogitHybridModel) ---
+        self.embeddings = nn.ModuleDict()
+        self.emb_dims: Dict[str, int] = {}
+        emb_out_dim = 0
+        for col in self.cat_cols:
+            vs = int(vocab_sizes[col])
+            ed = _choose_emb_dim(col, vs)
+            self.emb_dims[col] = ed
+            self.embeddings[col] = nn.Embedding(
+                num_embeddings=vs, embedding_dim=ed, padding_idx=PAD_NA_ID
+            )
+            emb_out_dim += ed
+
+        self.pt_norm = nn.LayerNorm(self.num_pt_statcast_cols)
+
+        mlp_in = emb_out_dim + self.num_pt_statcast_cols
+        emb_layers: List[nn.Module] = []
+        prev = mlp_in
+        for h in hidden_dims:
+            emb_layers.append(nn.Linear(prev, int(h)))
+            emb_layers.append(nn.ReLU())
+            emb_layers.append(nn.Dropout(float(dropout)))
+            prev = int(h)
+        emb_layers.append(nn.Linear(prev, self.num_classes))
+        self.emb_mlp = nn.Sequential(*emb_layers)
+
+        # --- Vector head (unchanged) ---
+        self.num_vectors = 6
+        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+
+        # --- Per-class gate network ---
+        # Input: abs_delta(6) + ent_vec(1) + ent_emb(1) + delta_l2(1) = 9
+        gate_in_dim = self.num_classes + 3  # 6 + 3 = 9
+        gate_hidden = 16
+        self.gate_net = nn.Sequential(
+            nn.Linear(gate_in_dim, gate_hidden),
+            nn.ReLU(),
+            nn.Linear(gate_hidden, self.num_classes),
+        )
+        # Initialize: final bias so sigmoid(bias) ~ gate_init_g, weights small
+        init_bias = math.log(gate_init_g / (1.0 - gate_init_g))
+        with torch.no_grad():
+            # First layer: small weights
+            nn.init.normal_(self.gate_net[0].weight, std=0.01)
+            self.gate_net[0].bias.zero_()
+            # Final layer: near-zero weights, bias = init_bias for all classes
+            nn.init.normal_(self.gate_net[2].weight, std=0.01)
+            self.gate_net[2].bias.fill_(init_bias)
+
+        # For tracking
+        self._last_gate_values: Optional[torch.Tensor] = None
+        self._last_abs_delta: Optional[torch.Tensor] = None
+
+        print(f"[MODEL] PerClassGateLogitHybridModel:")
+        print(f"  Embedding head: {self.emb_dims} + {self.num_pt_statcast_cols} statcast cols -> MLP {hidden_dims} -> {self.num_classes}")
+        print(f"  MLP input dim: {mlp_in}")
+        print(f"  Vector head: {self.num_vectors} vectors with log_n weighting (unchanged)")
+        print(f"  Gate: {gate_in_dim} features -> Linear({gate_in_dim},{gate_hidden}) -> ReLU -> Linear({gate_hidden},{self.num_classes}) -> sigmoid")
+        print(f"  Combination: vec_logits + g * (emb_logits - vec_logits)  [per-class]")
+        print(f"  Gate init bias: {init_bias:.4f} -> sigmoid ~ {gate_init_g:.3f}")
+
+    def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor) -> torch.Tensor:
+        # --- Embedding head with statcast block ---
+        emb_parts: List[torch.Tensor] = []
+        for i, col in enumerate(self.cat_cols):
+            ids = torch.clamp(x_cat[:, i], min=0, max=self.vocab_sizes[col] - 1)
+            emb_parts.append(self.embeddings[col](ids))
+
+        x_pt_raw = x_num[:, -self.num_pt_statcast_cols:]
+        x_pt = self.pt_norm(x_pt_raw)
+
+        emb_input = torch.cat(emb_parts + [x_pt], dim=1)
+        emb_logits = self.emb_mlp(emb_input)  # (B, 6)
+
+        # --- Vector head (uses first 43 cols, indices unchanged) ---
+        v1 = x_num[:, 1:7]
+        v2 = x_num[:, 8:14]
+        v3 = x_num[:, 15:21]
+        v4 = x_num[:, 22:28]
+        v5 = x_num[:, 29:35]
+        v6 = x_num[:, 36:42]
+
+        vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+
+        log_n = torch.stack([
+            x_num[:, 7], x_num[:, 14], x_num[:, 21],
+            x_num[:, 28], x_num[:, 35], x_num[:, 42],
+        ], dim=1)
+
+        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
+        vec_weights = torch.softmax(adjusted, dim=1)
+        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)
+        vec_logits = torch.log(vec_probs + 1e-8)  # (B, 6)
+
+        # --- Per-class contextual gate ---
+        delta = emb_logits - vec_logits  # (B, 6)
+        abs_delta = delta.abs()  # (B, 6)
+
+        # Entropies
+        eps = 1e-8
+        p_vec = torch.softmax(vec_logits, dim=1)
+        ent_vec = -(p_vec * torch.log(p_vec + eps)).sum(dim=1, keepdim=True)  # (B, 1)
+        p_emb = torch.softmax(emb_logits, dim=1)
+        ent_emb = -(p_emb * torch.log(p_emb + eps)).sum(dim=1, keepdim=True)  # (B, 1)
+
+        # Delta L2
+        delta_l2 = torch.sqrt((delta ** 2).mean(dim=1, keepdim=True))  # (B, 1)
+
+        gate_in = torch.cat([abs_delta, ent_vec, ent_emb, delta_l2], dim=1)  # (B, 9)
+        g = torch.sigmoid(self.gate_net(gate_in))  # (B, 6)
+
+        self._last_gate_values = g.detach()
+        self._last_abs_delta = abs_delta.detach()
+
+        combined_logits = vec_logits + g * delta  # (B, 6) elementwise
+
+        return combined_logits
+
+    def get_learned_weights(self) -> Dict[str, float]:
+        with torch.no_grad():
+            w = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+        return {
+            "v1_batter_overall": float(w[0]),
+            "v2_pitcher_overall": float(w[1]),
+            "v3_stadium": float(w[2]),
+            "v4_batter_platoon": float(w[3]),
+            "v5_pitcher_platoon": float(w[4]),
+            "v6_pitch_mix": float(w[5]),
+        }
+
+    def get_gate_net_params(self) -> Dict[str, object]:
+        with torch.no_grad():
+            bias = self.gate_net[2].bias.cpu().numpy()
+        return {
+            "final_bias_per_class": [float(b) for b in bias],
+            "final_bias_sigmoid_per_class": [float(1.0 / (1.0 + math.exp(-b))) for b in bias],
+        }
+
+
+def collect_per_class_gate_stats(
+    model: nn.Module,
+    dataset,
+    device: str,
+    class_names: List[str],
+) -> Dict[str, object]:
+    """Collect per-class g(x) and abs_delta stats on a dataset split."""
+    model.eval()
+    all_g = []
+    all_ad = []
+    with torch.no_grad():
+        for x_cat, x_num, y, w in dataset:
+            if y.numel() == 0:
+                continue
+            x_cat = x_cat.to(device, non_blocking=True)
+            x_num = x_num.to(device, non_blocking=True)
+            _ = model(x_cat, x_num)
+            if model._last_gate_values is not None:
+                all_g.append(model._last_gate_values.cpu())
+            if model._last_abs_delta is not None:
+                all_ad.append(model._last_abs_delta.cpu())
+    if not all_g:
+        return {}
+    g_all = torch.cat(all_g, dim=0).numpy()  # (N, 6)
+    ad_all = torch.cat(all_ad, dim=0).numpy()  # (N, 6)
+
+    stats = {}
+    for k, name in enumerate(class_names):
+        g_k = g_all[:, k]
+        ad_k = ad_all[:, k]
+        stats[name] = {
+            "g_mean": float(g_k.mean()),
+            "g_std": float(g_k.std()),
+            "g_p10": float(np.percentile(g_k, 10)),
+            "g_p50": float(np.percentile(g_k, 50)),
+            "g_p90": float(np.percentile(g_k, 90)),
+            "abs_delta_mean": float(ad_k.mean()),
+        }
+    # Also overall stats
+    stats["_overall"] = {
+        "g_mean": float(g_all.mean()),
+        "g_std": float(g_all.std()),
+    }
+    return stats
+
+
 # -----------------------------
 # Training / Evaluation
 # -----------------------------
@@ -1650,11 +2100,18 @@ def main() -> None:
                          help="Feed 90 pitch-type statcast cols into the embedding head")
     _parser.add_argument("--use_pitchtype_statcast_v2", action="store_true", default=False,
                          help="Feed 210 pitch-type statcast v2 cols into the embedding head")
+    _parser.add_argument("--use_contextual_gate_logit", action="store_true", default=False,
+                         help="Use contextual gate g(x) for logit-space mixing instead of global a,b")
+    _parser.add_argument("--use_per_class_gate_logit", action="store_true", default=False,
+                         help="Use per-class contextual gate g_k(x) with disagreement features")
     _parser.add_argument("--artifact_dir", type=str, default=None,
                          help="Override artifact output directory")
     _args = _parser.parse_args()
     pre_dir = _args.preprocessed_dir
-    use_pt_statcast = _args.use_pitchtype_statcast_block or _args.use_pitchtype_statcast_v2
+    use_pt_statcast = (_args.use_pitchtype_statcast_block or _args.use_pitchtype_statcast_v2
+                       or _args.use_contextual_gate_logit or _args.use_per_class_gate_logit)
+    use_contextual_gate = _args.use_contextual_gate_logit
+    use_per_class_gate = _args.use_per_class_gate_logit
     artifact_dir = _args.artifact_dir if _args.artifact_dir else ARTIFACT_DIR
 
     # Reproducibility
@@ -1793,7 +2250,31 @@ def main() -> None:
                         c.startswith("batter_SV_") or c.startswith("batter_OTHER_")]
     num_pt_statcast = len(pt_statcast_cols)
 
-    if use_pt_statcast and num_pt_statcast > 0 and len(cat_cols) > 0:
+    if use_per_class_gate and num_pt_statcast > 0 and len(cat_cols) > 0:
+        print(f"[CONFIG] Using PerClassGateLogitHybridModel ({num_pt_statcast} statcast cols + per-class gate)")
+        model = PerClassGateLogitHybridModel(
+            cat_cols=cat_cols,
+            num_numeric=len(num_cols),
+            vocab_sizes=vocab_sizes,
+            num_classes=num_classes,
+            hidden_dims=HIDDEN_DIMS,
+            dropout=DROPOUT,
+            num_pt_statcast_cols=num_pt_statcast,
+            gate_init_g=0.326,
+        ).to(DEVICE)
+    elif use_contextual_gate and num_pt_statcast > 0 and len(cat_cols) > 0:
+        print(f"[CONFIG] Using ContextualGateLogitHybridModel ({num_pt_statcast} statcast cols + contextual gate)")
+        model = ContextualGateLogitHybridModel(
+            cat_cols=cat_cols,
+            num_numeric=len(num_cols),
+            vocab_sizes=vocab_sizes,
+            num_classes=num_classes,
+            hidden_dims=HIDDEN_DIMS,
+            dropout=DROPOUT,
+            num_pt_statcast_cols=num_pt_statcast,
+            gate_init_g=0.38,
+        ).to(DEVICE)
+    elif use_pt_statcast and num_pt_statcast > 0 and len(cat_cols) > 0:
         print(f"[CONFIG] Using StatcastLogitHybridModel ({num_pt_statcast} statcast cols in embedding head)")
         model = StatcastLogitHybridModel(
             cat_cols=cat_cols,
@@ -2060,9 +2541,70 @@ def main() -> None:
         print("=" * 50 + "\n")
         metrics["hybrid_ab_weights"] = ab_weights
 
+    # Log contextual gate stats
+    if hasattr(model, 'get_gate_params'):
+        gate_params = model.get_gate_params()
+        print("=" * 50)
+        print("GATE PARAMETERS:")
+        print("=" * 50)
+        for name, val in gate_params.items():
+            print(f"  {name}: {val:.6f}")
+        print("=" * 50)
+        metrics["gate_params"] = gate_params
+
+        # Collect gate value stats on val and test
+        print("\nCollecting gate g(x) statistics on val/test...")
+        val_gate_stats = collect_gate_stats(model, val_loader, DEVICE)
+        test_gate_stats = collect_gate_stats(model, test_loader, DEVICE)
+        print(f"\n  Val  g(x): mean={val_gate_stats['mean']:.4f}, std={val_gate_stats['std']:.4f}, "
+              f"[p5={val_gate_stats['p5']:.4f}, p25={val_gate_stats['p25']:.4f}, "
+              f"p50={val_gate_stats['p50']:.4f}, p75={val_gate_stats['p75']:.4f}, p95={val_gate_stats['p95']:.4f}]")
+        print(f"  Test g(x): mean={test_gate_stats['mean']:.4f}, std={test_gate_stats['std']:.4f}, "
+              f"[p5={test_gate_stats['p5']:.4f}, p25={test_gate_stats['p25']:.4f}, "
+              f"p50={test_gate_stats['p50']:.4f}, p75={test_gate_stats['p75']:.4f}, p95={test_gate_stats['p95']:.4f}]")
+        metrics["gate_stats_val"] = val_gate_stats
+        metrics["gate_stats_test"] = test_gate_stats
+
+    # Log per-class gate stats
+    if hasattr(model, 'get_gate_net_params') and hasattr(model, '_last_abs_delta'):
+        gate_net_params = model.get_gate_net_params()
+        print("\n" + "=" * 50)
+        print("PER-CLASS GATE NET PARAMETERS:")
+        print("=" * 50)
+        for k, (bias_val, sig_val) in enumerate(zip(
+            gate_net_params["final_bias_per_class"],
+            gate_net_params["final_bias_sigmoid_per_class"]
+        )):
+            print(f"  class {k}: bias={bias_val:.4f}, sigmoid(bias)={sig_val:.4f}")
+        print("=" * 50)
+        metrics["gate_net_params"] = gate_net_params
+
+        print("\nCollecting per-class gate g_k(x) statistics on val/test...")
+        val_pc_stats = collect_per_class_gate_stats(model, val_loader, DEVICE, label_set_ordered)
+        test_pc_stats = collect_per_class_gate_stats(model, test_loader, DEVICE, label_set_ordered)
+
+        print(f"\n  {'Class':<8s} | {'Val g mean':>10s} {'Val g std':>10s} {'Val g p10':>10s} {'Val g p50':>10s} {'Val g p90':>10s} | {'abs_d mean':>10s}")
+        print(f"  {'-'*74}")
+        for name in label_set_ordered:
+            vs = val_pc_stats[name]
+            print(f"  {name:<8s} | {vs['g_mean']:>10.4f} {vs['g_std']:>10.4f} {vs['g_p10']:>10.4f} {vs['g_p50']:>10.4f} {vs['g_p90']:>10.4f} | {vs['abs_delta_mean']:>10.4f}")
+        vo = val_pc_stats["_overall"]
+        print(f"  {'OVERALL':<8s} | {vo['g_mean']:>10.4f} {vo['g_std']:>10.4f}")
+
+        print(f"\n  {'Class':<8s} | {'Test g mean':>10s} {'Test g std':>10s} {'Test g p10':>10s} {'Test g p50':>10s} {'Test g p90':>10s} | {'abs_d mean':>10s}")
+        print(f"  {'-'*74}")
+        for name in label_set_ordered:
+            ts = test_pc_stats[name]
+            print(f"  {name:<8s} | {ts['g_mean']:>10.4f} {ts['g_std']:>10.4f} {ts['g_p10']:>10.4f} {ts['g_p50']:>10.4f} {ts['g_p90']:>10.4f} | {ts['abs_delta_mean']:>10.4f}")
+        to = test_pc_stats["_overall"]
+        print(f"  {'OVERALL':<8s} | {to['g_mean']:>10.4f} {to['g_std']:>10.4f}")
+
+        metrics["per_class_gate_stats_val"] = val_pc_stats
+        metrics["per_class_gate_stats_test"] = test_pc_stats
+
     _write_json(os.path.join(artifact_dir, "metrics.json"), metrics)
 
-    print(f"Artifacts saved to: {artifact_dir}")
+    print(f"\nArtifacts saved to: {artifact_dir}")
     print(f"  - {model_path}")
     print("  - train_config.json, label_to_index.json, index_to_label.json, metadata.json, metrics.json")
 
@@ -2080,12 +2622,22 @@ def main() -> None:
             ("C: Hybrid (prob mix)",        1.4311, 1.4719, 174_676, 13),
             ("D: Hybrid (logit mix)",       1.4307, 1.4695, 174_676, 13),
             ("E: Hybrid + PT Statcast v1",  1.4302, 1.4674, 188_330, 32),
+            ("F: Hybrid + PT Statcast v2",  1.4302, 1.4681, 228_856, 13),
+            ("G: Hybrid + PT Stat + Ctx Gate", 1.4302, 1.4669, 197_898, 11),
         ]
 
+        # Determine this run's label
+        if use_per_class_gate:
+            this_label = "H: Hybrid + PT Stat + PerClass Gate"
+        elif use_contextual_gate:
+            this_label = "G: Hybrid + PT Stat + Ctx Gate"
+        else:
+            this_label = "H: This run"
+
         lines = []
-        sep = "=" * 90
-        hdr = f"  {'Model':<35s} {'Params':>8s} {'Epoch':>6s} {'Val LL':>10s} {'%vsBase':>8s} {'Test LL':>10s} {'%vsBase':>8s}"
-        dash = "-" * 90
+        sep = "=" * 95
+        hdr = f"  {'Model':<38s} {'Params':>8s} {'Epoch':>6s} {'Val LL':>10s} {'%vsBase':>8s} {'Test LL':>10s} {'%vsBase':>8s}"
+        dash = "-" * 95
 
         lines.append(sep)
         lines.append("  COMPARISON TABLE")
@@ -2095,13 +2647,13 @@ def main() -> None:
         for name, vl, tl, params, ep in prior:
             vp = 100.0 * (base_val - vl) / base_val
             tp = 100.0 * (base_test - tl) / base_test
-            lines.append(f"  {name:<35s} {params:>8,d} {ep:>6d} {vl:>10.4f} {vp:>+7.2f}% {tl:>10.4f} {tp:>+7.2f}%")
+            lines.append(f"  {name:<38s} {params:>8,d} {ep:>6d} {vl:>10.4f} {vp:>+7.2f}% {tl:>10.4f} {tp:>+7.2f}%")
         # This run
         vp = 100.0 * (base_val - val_ll) / base_val
         tp = 100.0 * (base_test - test_ll) / base_test
-        lines.append(f"  {'F: Hybrid + PT Statcast v2':<35s} {n_params:>8,d} {best_epoch:>6d} {val_ll:>10.4f} {vp:>+7.2f}% {test_ll:>10.4f} {tp:>+7.02f}%")
+        lines.append(f"  {this_label:<38s} {n_params:>8,d} {best_epoch:>6d} {val_ll:>10.4f} {vp:>+7.2f}% {test_ll:>10.4f} {tp:>+7.02f}%")
         lines.append(dash)
-        lines.append(f"  {'Base rate':<35s} {'--':>8s} {'--':>6s} {base_val:>10.4f} {'--':>8s} {base_test:>10.4f} {'--':>8s}")
+        lines.append(f"  {'Base rate':<38s} {'--':>8s} {'--':>6s} {base_val:>10.4f} {'--':>8s} {base_test:>10.4f} {'--':>8s}")
         lines.append(sep)
 
         table_str = "\n".join(lines)
@@ -2117,8 +2669,10 @@ def main() -> None:
                 "C_hybrid_prob": {"val_ll": 1.4311, "test_ll": 1.4719},
                 "D_hybrid_logit": {"val_ll": 1.4307, "test_ll": 1.4695},
                 "E_hybrid_pt_statcast_v1": {"val_ll": 1.4302, "test_ll": 1.4674},
-                "F_hybrid_pt_statcast_v2": {"val_ll": val_ll, "test_ll": test_ll,
-                                            "params": n_params, "best_epoch": best_epoch},
+                "F_hybrid_pt_statcast_v2": {"val_ll": 1.4302, "test_ll": 1.4681},
+                "G_ctx_gate": {"val_ll": 1.4302, "test_ll": 1.4669},
+                "H_this_run": {"val_ll": val_ll, "test_ll": test_ll,
+                               "params": n_params, "best_epoch": best_epoch},
             },
             "base_rate": {"val_ll": base_val, "test_ll": base_test},
         })
