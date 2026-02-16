@@ -111,6 +111,7 @@ ENABLE_EMBEDDINGS = True        # Enabled for hybrid model experiment
 ENABLE_BUCKET_FEATURES = False  # Set to False to disable bucket-weighted tendency features
 ENABLE_PARK_FACTORS = False     # Set to False to disable park factor features
 ENABLE_PITCHTYPE_STATCAST_BLOCK = False  # Pitch-type statcast block (90 cols, CLI toggle)
+ENABLE_PITCHTYPE_STATCAST_V2 = False    # Pitch-type statcast v2 block (extended cols, CLI toggle)
 
 # PA-level feature columns
 PA_ID_COL = "pa_id"
@@ -1689,6 +1690,334 @@ def compute_pitchtype_statcast_block(input_csv: str, split_info: SplitInfo):
     return pitcher_wide, batter_wide
 
 
+# =========================
+# Pitch-Type Statcast V2 Block
+# =========================
+
+# Pitcher mean cols (same as v1 base)
+_V2_PITCHER_MEAN_COLS = [
+    "release_speed", "release_spin_rate", "pfx_x", "pfx_z",
+]
+
+# Pitcher shape cols (extension, release point, effective speed)
+_V2_PITCHER_SHAPE_COLS = [
+    "release_extension", "release_pos_x", "release_pos_z", "effective_speed",
+]
+
+# Spin axis is special: encoded as sin/cos
+_V2_HAS_SPIN_AXIS = True  # we verified it exists
+
+
+def _pitchtype_statcast_v2_feature_names():
+    """Return the v2 feature column names in deterministic order."""
+    cols = []
+    for pt in PITCH_TYPES:
+        # Pitcher block (21 per pt)
+        cols.append(f"pitcher_pitch_rate_{pt}")
+        for stat in _V2_PITCHER_MEAN_COLS:
+            cols.append(f"pitcher_{pt}_{stat}")
+        cols.append(f"pitcher_{pt}_zone_rate")
+        cols.append(f"pitcher_{pt}_heart_rate")
+        cols.append(f"pitcher_{pt}_shadow_rate")
+        cols.append(f"pitcher_{pt}_chase_rate")
+        cols.append(f"pitcher_{pt}_waste_rate")
+        cols.append(f"pitcher_{pt}_plate_x_std")
+        cols.append(f"pitcher_{pt}_plate_z_std")
+        for stat in _V2_PITCHER_SHAPE_COLS:
+            cols.append(f"pitcher_{pt}_{stat}")
+        if _V2_HAS_SPIN_AXIS:
+            cols.append(f"pitcher_{pt}_spin_axis_sin")
+            cols.append(f"pitcher_{pt}_spin_axis_cos")
+        # Batter block (3 per pt)
+        cols.append(f"batter_{pt}_launch_speed")
+        cols.append(f"batter_{pt}_launch_angle")
+        cols.append(f"batter_{pt}_contact_rate")
+    return cols
+
+
+def compute_pitchtype_statcast_block_v2(input_csv: str, split_info: SplitInfo):
+    """
+    Compute TRAIN-only extended pitcher/batter statcast stats per pitch type.
+
+    Returns:
+        pitcher_wide: DataFrame keyed by pitcher_id (str)
+        batter_wide:  DataFrame keyed by batter_id (str)
+    """
+    print("[PT STATCAST V2] Computing TRAIN-only pitch-type statcast v2 block...")
+    train_end = pd.to_datetime(split_info.train_end_date)
+
+    pitcher_records = []
+    batter_records = []
+
+    all_pitcher_mean_cols = _V2_PITCHER_MEAN_COLS + ["plate_x", "plate_z"] + _V2_PITCHER_SHAPE_COLS
+    if _V2_HAS_SPIN_AXIS:
+        all_pitcher_mean_cols.append("spin_axis")
+
+    for i, chunk in enumerate(pd.read_csv(input_csv, chunksize=READ_CHUNK_ROWS, low_memory=True)):
+        chunk[GAME_DATE_COL] = pd.to_datetime(chunk[GAME_DATE_COL], errors="coerce").dt.normalize()
+        train_mask = chunk[GAME_DATE_COL].notna() & (chunk[GAME_DATE_COL] <= train_end)
+        df = chunk.loc[train_mask].copy()
+        if df.empty:
+            continue
+
+        df["pt_bin"] = _pitch_type_bin(df[PITCH_TYPE_COL])
+
+        # Coerce numeric columns
+        for col in all_pitcher_mean_cols + ["launch_speed", "launch_angle", "sz_top", "sz_bot"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            else:
+                df[col] = np.nan
+
+        # Zone classification
+        if "zone" in df.columns:
+            zone_val = pd.to_numeric(df["zone"], errors="coerce")
+            df["in_zone"] = zone_val.between(1, 9).astype("float64")
+        else:
+            df["in_zone"] = (
+                (df["plate_x"].abs() <= 0.83) &
+                (df["plate_z"] >= df["sz_bot"]) &
+                (df["plate_z"] <= df["sz_top"])
+            ).astype("float64")
+
+        # Attack zone classification
+        eps = 0.01
+        sz_range = (df["sz_top"] - df["sz_bot"]).clip(lower=eps)
+        z_norm = (df["plate_z"] - df["sz_bot"]) / sz_range
+        px = df["plate_x"]
+
+        heart = (px.abs() <= 0.40) & (z_norm >= 0.33) & (z_norm <= 0.66)
+        shadow_box = (px.abs() <= 1.08) & (z_norm >= -0.20) & (z_norm <= 1.20)
+        shadow = shadow_box & ~heart
+        chase_box = (px.abs() <= 1.40) & (z_norm >= -0.50) & (z_norm <= 1.50)
+        chase = chase_box & ~shadow_box
+        waste = ~chase_box
+
+        df["is_heart"] = heart.astype("float64")
+        df["is_shadow"] = shadow.astype("float64")
+        df["is_chase"] = chase.astype("float64")
+        df["is_waste"] = waste.astype("float64")
+
+        # Spin axis sin/cos
+        if _V2_HAS_SPIN_AXIS and "spin_axis" in df.columns:
+            sa_rad = df["spin_axis"] * (np.pi / 180.0)
+            df["spin_axis_sin"] = np.sin(sa_rad)
+            df["spin_axis_cos"] = np.cos(sa_rad)
+
+        # --- Pitcher aggregation (ALL pitches) ---
+        agg_dict = {"n_pitches": ("pt_bin", "size")}
+        for c in _V2_PITCHER_MEAN_COLS + _V2_PITCHER_SHAPE_COLS:
+            agg_dict[f"sum_{c}"] = (c, "sum")
+            agg_dict[f"cnt_{c}"] = (c, "count")
+        # plate_x/z for std
+        agg_dict["sum_plate_x"] = ("plate_x", "sum")
+        agg_dict["cnt_plate_x"] = ("plate_x", "count")
+        agg_dict["ssq_plate_x"] = ("plate_x", lambda x: (x**2).sum())
+        agg_dict["sum_plate_z"] = ("plate_z", "sum")
+        agg_dict["cnt_plate_z"] = ("plate_z", "count")
+        agg_dict["ssq_plate_z"] = ("plate_z", lambda x: (x**2).sum())
+        # Zone rates
+        agg_dict["sum_in_zone"] = ("in_zone", "sum")
+        agg_dict["sum_heart"] = ("is_heart", "sum")
+        agg_dict["sum_shadow"] = ("is_shadow", "sum")
+        agg_dict["sum_chase"] = ("is_chase", "sum")
+        agg_dict["sum_waste"] = ("is_waste", "sum")
+        # Spin axis sin/cos
+        if _V2_HAS_SPIN_AXIS:
+            agg_dict["sum_spin_axis_sin"] = ("spin_axis_sin", "sum")
+            agg_dict["cnt_spin_axis_sin"] = ("spin_axis_sin", "count")
+            agg_dict["sum_spin_axis_cos"] = ("spin_axis_cos", "sum")
+            agg_dict["cnt_spin_axis_cos"] = ("spin_axis_cos", "count")
+
+        pitcher_agg = df.groupby([PITCHER_ID_COL, "pt_bin"]).agg(**agg_dict).reset_index()
+        pitcher_records.append(pitcher_agg)
+
+        # --- Batter aggregation (PA-ending pitches only) ---
+        if "is_last_pitch_of_pa" in df.columns:
+            is_last = pd.to_numeric(df["is_last_pitch_of_pa"], errors="coerce").fillna(0).astype("int64")
+        elif "pitch_number_in_pa" in df.columns and "pa_id" in df.columns:
+            max_pitch = df.groupby("pa_id")["pitch_number_in_pa"].transform("max")
+            is_last = (df["pitch_number_in_pa"] == max_pitch).astype("int64")
+        else:
+            is_last = pd.Series(1, index=df.index)
+
+        pa_df = df.loc[is_last == 1].copy()
+        if not pa_df.empty:
+            pa_df["has_contact"] = pa_df["launch_speed"].notna().astype("float64")
+            batter_agg = pa_df.groupby([BATTER_ID_COL, "pt_bin"]).agg(
+                n_pa=("pt_bin", "size"),
+                sum_launch_speed=("launch_speed", "sum"),
+                cnt_launch_speed=("launch_speed", "count"),
+                sum_launch_angle=("launch_angle", "sum"),
+                cnt_launch_angle=("launch_angle", "count"),
+                sum_has_contact=("has_contact", "sum"),
+            ).reset_index()
+            batter_records.append(batter_agg)
+
+        if (i + 1) % 5 == 0:
+            print(f"  [PT STATCAST V2] processed {(i+1)*READ_CHUNK_ROWS:,} rows...")
+
+    # --- Aggregate across chunks ---
+    pitcher_all = pd.concat(pitcher_records, ignore_index=True)
+    # Sum numeric columns across chunks
+    sum_cols = [c for c in pitcher_all.columns if c not in [PITCHER_ID_COL, "pt_bin"]]
+    pitcher_all = pitcher_all.groupby([PITCHER_ID_COL, "pt_bin"])[sum_cols].sum().reset_index()
+
+    # Compute pitcher means
+    for c in _V2_PITCHER_MEAN_COLS + _V2_PITCHER_SHAPE_COLS:
+        pitcher_all[f"mean_{c}"] = pitcher_all[f"sum_{c}"] / pitcher_all[f"cnt_{c}"].replace(0, np.nan)
+
+    # Spin axis sin/cos means
+    if _V2_HAS_SPIN_AXIS:
+        pitcher_all["mean_spin_axis_sin"] = pitcher_all["sum_spin_axis_sin"] / pitcher_all["cnt_spin_axis_sin"].replace(0, np.nan)
+        pitcher_all["mean_spin_axis_cos"] = pitcher_all["sum_spin_axis_cos"] / pitcher_all["cnt_spin_axis_cos"].replace(0, np.nan)
+
+    # Plate x/z std: std = sqrt(E[x^2] - E[x]^2)
+    for coord in ["plate_x", "plate_z"]:
+        n = pitcher_all[f"cnt_{coord}"].replace(0, np.nan)
+        mean = pitcher_all[f"sum_{coord}"] / n
+        mean_sq = pitcher_all[f"ssq_{coord}"] / n
+        pitcher_all[f"std_{coord}"] = np.sqrt((mean_sq - mean**2).clip(lower=0))
+
+    # Pitch rates
+    pitcher_total = pitcher_all.groupby(PITCHER_ID_COL)["n_pitches"].transform("sum")
+    pitcher_all["pitch_rate"] = pitcher_all["n_pitches"] / pitcher_total.replace(0, np.nan)
+
+    # Zone/attack rates
+    pitcher_all["zone_rate"] = pitcher_all["sum_in_zone"] / pitcher_all["n_pitches"].replace(0, np.nan)
+    pitcher_all["heart_rate"] = pitcher_all["sum_heart"] / pitcher_all["n_pitches"].replace(0, np.nan)
+    pitcher_all["shadow_rate"] = pitcher_all["sum_shadow"] / pitcher_all["n_pitches"].replace(0, np.nan)
+    pitcher_all["chase_rate"] = pitcher_all["sum_chase"] / pitcher_all["n_pitches"].replace(0, np.nan)
+    pitcher_all["waste_rate"] = pitcher_all["sum_waste"] / pitcher_all["n_pitches"].replace(0, np.nan)
+
+    # Pitcher overall fallbacks
+    pitcher_overall = {}
+    for c in _V2_PITCHER_MEAN_COLS + _V2_PITCHER_SHAPE_COLS:
+        pitcher_overall[c] = pitcher_all.groupby(PITCHER_ID_COL).apply(
+            lambda g: g[f"sum_{c}"].sum() / max(g[f"cnt_{c}"].sum(), 1), include_groups=False
+        )
+    for coord in ["plate_x", "plate_z"]:
+        pitcher_overall[f"std_{coord}"] = pitcher_all.groupby(PITCHER_ID_COL).apply(
+            lambda g: np.sqrt(max(g[f"ssq_{coord}"].sum() / max(g[f"cnt_{coord}"].sum(), 1)
+                              - (g[f"sum_{coord}"].sum() / max(g[f"cnt_{coord}"].sum(), 1))**2, 0)),
+            include_groups=False
+        )
+    if _V2_HAS_SPIN_AXIS:
+        for sc in ["spin_axis_sin", "spin_axis_cos"]:
+            pitcher_overall[sc] = pitcher_all.groupby(PITCHER_ID_COL).apply(
+                lambda g, _sc=sc: g[f"sum_{_sc}"].sum() / max(g[f"cnt_{_sc}"].sum(), 1), include_groups=False
+            )
+    # Zone rate overalls
+    for zr in ["zone_rate", "heart_rate", "shadow_rate", "chase_rate", "waste_rate"]:
+        sum_col = f"sum_{zr.replace('_rate', '')}" if zr != "zone_rate" else "sum_in_zone"
+        pitcher_overall[zr] = pitcher_all.groupby(PITCHER_ID_COL).apply(
+            lambda g, _sc=sum_col: g[_sc].sum() / max(g["n_pitches"].sum(), 1), include_groups=False
+        )
+
+    # Pivot pitcher wide
+    all_pitchers = pitcher_all[PITCHER_ID_COL].unique()
+    pitcher_wide_parts = []
+    for pt in PITCH_TYPES:
+        pt_data = pitcher_all.loc[pitcher_all["pt_bin"] == pt].set_index(PITCHER_ID_COL)
+        pt_df = pd.DataFrame(index=all_pitchers)
+
+        pt_df[f"pitcher_pitch_rate_{pt}"] = pt_data["pitch_rate"].reindex(all_pitchers).fillna(0.0)
+        for c in _V2_PITCHER_MEAN_COLS:
+            col = f"pitcher_{pt}_{c}"
+            pt_df[col] = pt_data[f"mean_{c}"].reindex(all_pitchers)
+            mask = pt_df[col].isna()
+            if mask.any():
+                pt_df.loc[mask, col] = pt_df.index[mask].map(pitcher_overall[c])
+            pt_df[col] = pt_df[col].fillna(0.0)
+
+        pt_df[f"pitcher_{pt}_zone_rate"] = pt_data["zone_rate"].reindex(all_pitchers)
+        pt_df[f"pitcher_{pt}_heart_rate"] = pt_data["heart_rate"].reindex(all_pitchers)
+        pt_df[f"pitcher_{pt}_shadow_rate"] = pt_data["shadow_rate"].reindex(all_pitchers)
+        pt_df[f"pitcher_{pt}_chase_rate"] = pt_data["chase_rate"].reindex(all_pitchers)
+        pt_df[f"pitcher_{pt}_waste_rate"] = pt_data["waste_rate"].reindex(all_pitchers)
+        for zr in ["zone_rate", "heart_rate", "shadow_rate", "chase_rate", "waste_rate"]:
+            col = f"pitcher_{pt}_{zr}"
+            mask = pt_df[col].isna()
+            if mask.any():
+                pt_df.loc[mask, col] = pt_df.index[mask].map(pitcher_overall[zr])
+            pt_df[col] = pt_df[col].fillna(0.0)
+
+        for coord in ["plate_x", "plate_z"]:
+            col = f"pitcher_{pt}_{coord}_std"
+            pt_df[col] = pt_data[f"std_{coord}"].reindex(all_pitchers)
+            mask = pt_df[col].isna()
+            if mask.any():
+                pt_df.loc[mask, col] = pt_df.index[mask].map(pitcher_overall[f"std_{coord}"])
+            pt_df[col] = pt_df[col].fillna(0.0)
+
+        for c in _V2_PITCHER_SHAPE_COLS:
+            col = f"pitcher_{pt}_{c}"
+            pt_df[col] = pt_data[f"mean_{c}"].reindex(all_pitchers)
+            mask = pt_df[col].isna()
+            if mask.any():
+                pt_df.loc[mask, col] = pt_df.index[mask].map(pitcher_overall[c])
+            pt_df[col] = pt_df[col].fillna(0.0)
+
+        if _V2_HAS_SPIN_AXIS:
+            for sc in ["spin_axis_sin", "spin_axis_cos"]:
+                col = f"pitcher_{pt}_{sc}"
+                pt_df[col] = pt_data[f"mean_{sc}"].reindex(all_pitchers)
+                mask = pt_df[col].isna()
+                if mask.any():
+                    pt_df.loc[mask, col] = pt_df.index[mask].map(pitcher_overall[sc])
+                pt_df[col] = pt_df[col].fillna(0.0)
+
+        pitcher_wide_parts.append(pt_df)
+
+    pitcher_wide = pd.concat(pitcher_wide_parts, axis=1).astype("float32")
+    pitcher_wide.index.name = PITCHER_ID_COL
+
+    # --- Batter aggregation ---
+    batter_all = pd.concat(batter_records, ignore_index=True)
+    batter_sum_cols = [c for c in batter_all.columns if c not in [BATTER_ID_COL, "pt_bin"]]
+    batter_all = batter_all.groupby([BATTER_ID_COL, "pt_bin"])[batter_sum_cols].sum().reset_index()
+
+    batter_all["mean_launch_speed"] = batter_all["sum_launch_speed"] / batter_all["cnt_launch_speed"].replace(0, np.nan)
+    batter_all["mean_launch_angle"] = batter_all["sum_launch_angle"] / batter_all["cnt_launch_angle"].replace(0, np.nan)
+    batter_all["contact_rate"] = batter_all["sum_has_contact"] / batter_all["n_pa"].replace(0, np.nan)
+
+    # Batter overall fallbacks
+    batter_overall_ls = batter_all.groupby(BATTER_ID_COL).apply(
+        lambda g: g["sum_launch_speed"].sum() / max(g["cnt_launch_speed"].sum(), 1), include_groups=False)
+    batter_overall_la = batter_all.groupby(BATTER_ID_COL).apply(
+        lambda g: g["sum_launch_angle"].sum() / max(g["cnt_launch_angle"].sum(), 1), include_groups=False)
+    batter_overall_cr = batter_all.groupby(BATTER_ID_COL).apply(
+        lambda g: g["sum_has_contact"].sum() / max(g["n_pa"].sum(), 1), include_groups=False)
+
+    all_batters = batter_all[BATTER_ID_COL].unique()
+    batter_wide_parts = []
+    for pt in PITCH_TYPES:
+        pt_data = batter_all.loc[batter_all["pt_bin"] == pt].set_index(BATTER_ID_COL)
+        pt_df = pd.DataFrame(index=all_batters)
+
+        for stat, overall, src in [
+            (f"batter_{pt}_launch_speed", batter_overall_ls, "mean_launch_speed"),
+            (f"batter_{pt}_launch_angle", batter_overall_la, "mean_launch_angle"),
+            (f"batter_{pt}_contact_rate", batter_overall_cr, "contact_rate"),
+        ]:
+            pt_df[stat] = pt_data[src].reindex(all_batters)
+            mask = pt_df[stat].isna()
+            if mask.any():
+                pt_df.loc[mask, stat] = pt_df.index[mask].map(overall)
+            pt_df[stat] = pt_df[stat].fillna(0.0)
+
+        batter_wide_parts.append(pt_df)
+
+    batter_wide = pd.concat(batter_wide_parts, axis=1).astype("float32")
+    batter_wide.index.name = BATTER_ID_COL
+
+    total_cols = len(pitcher_wide.columns) + len(batter_wide.columns)
+    print(f"[PT STATCAST V2] Done. Pitcher: {len(pitcher_wide)} x {len(pitcher_wide.columns)} cols, "
+          f"Batter: {len(batter_wide)} x {len(batter_wide.columns)} cols, Total per-PA cols: {total_cols}")
+
+    return pitcher_wide, batter_wide
+
+
 def _build_feature_list():
     """Build feature lists dynamically based on feature toggles."""
     categorical_cols = list(CATEGORICAL_COLS) if ENABLE_EMBEDDINGS else []
@@ -1734,6 +2063,9 @@ def _build_feature_list():
 
     if ENABLE_PITCHTYPE_STATCAST_BLOCK:
         numeric_cols.extend(_pitchtype_statcast_feature_names())
+
+    if ENABLE_PITCHTYPE_STATCAST_V2:
+        numeric_cols.extend(_pitchtype_statcast_v2_feature_names())
 
     return categorical_cols, numeric_cols
 
@@ -1855,6 +2187,7 @@ def pass3_write_pa_splits(
     six_vector_stats: Optional[Dict],
     output_format: str,
     pitchtype_statcast: Optional[Tuple[pd.DataFrame, pd.DataFrame]] = None,
+    pitchtype_statcast_v2: Optional[Tuple[pd.DataFrame, pd.DataFrame]] = None,
 ) -> Dict[str, object]:
     """
     Build PA-level rows with matchup features, encode categoricals, write splits.
@@ -1979,6 +2312,20 @@ def pass3_write_pa_splits(
                 for col in batter_wide.columns:
                     pa_chunk[col] = batter_matched[col].fillna(0.0).astype("float32").values
 
+            # Merge pitch-type statcast v2 block
+            if ENABLE_PITCHTYPE_STATCAST_V2 and pitchtype_statcast_v2 is not None:
+                pitcher_wide_v2, batter_wide_v2 = pitchtype_statcast_v2
+                pid_str = pa_chunk[PITCHER_ID_COL].astype("string")
+                bid_str = pa_chunk[BATTER_ID_COL].astype("string")
+                pitcher_matched = pitcher_wide_v2.reindex(pid_str.values)
+                pitcher_matched.index = pa_chunk.index
+                for col in pitcher_wide_v2.columns:
+                    pa_chunk[col] = pitcher_matched[col].fillna(0.0).astype("float32").values
+                batter_matched = batter_wide_v2.reindex(bid_str.values)
+                batter_matched.index = pa_chunk.index
+                for col in batter_wide_v2.columns:
+                    pa_chunk[col] = batter_matched[col].fillna(0.0).astype("float32").values
+
             # Encode categoricals with TRAIN vocabs (UNK=1) - only if embeddings enabled
             if ENABLE_EMBEDDINGS:
                 pa_chunk[BATTER_ID_COL] = _encode_categorical(pa_chunk[BATTER_ID_COL].astype("string"), vocabs["batter_id"])
@@ -2081,6 +2428,7 @@ def write_metadata_json(fit: FitStats, transform_summary: Dict[str, object], lea
             "ENABLE_BUCKET_FEATURES": ENABLE_BUCKET_FEATURES,
             "ENABLE_PARK_FACTORS": ENABLE_PARK_FACTORS,
             "ENABLE_PITCHTYPE_STATCAST_BLOCK": ENABLE_PITCHTYPE_STATCAST_BLOCK,
+            "ENABLE_PITCHTYPE_STATCAST_V2": ENABLE_PITCHTYPE_STATCAST_V2,
         },
     }
 
@@ -2096,7 +2444,7 @@ def write_metadata_json(fit: FitStats, transform_summary: Dict[str, object], lea
 # =========================
 
 def main() -> None:
-    global INPUT_CSV, OUTPUT_DIR, OUTPUT_FORMAT, ENABLE_PITCHTYPE_STATCAST_BLOCK
+    global INPUT_CSV, OUTPUT_DIR, OUTPUT_FORMAT, ENABLE_PITCHTYPE_STATCAST_BLOCK, ENABLE_PITCHTYPE_STATCAST_V2
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_csv", type=str, default=INPUT_CSV)
     parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
@@ -2105,6 +2453,8 @@ def main() -> None:
     parser.add_argument("--val_end_date", type=str, default=VAL_END_DATE)
     parser.add_argument("--enable_pitchtype_statcast_block", action="store_true", default=False,
                         help="Enable pitch-type statcast feature block (90 extra numeric cols)")
+    parser.add_argument("--enable_pitchtype_statcast_v2", action="store_true", default=False,
+                        help="Enable pitch-type statcast v2 block (210 extra numeric cols)")
     args = parser.parse_args()
 
     INPUT_CSV = args.input_csv
@@ -2112,6 +2462,8 @@ def main() -> None:
     OUTPUT_FORMAT = args.output_format
     if args.enable_pitchtype_statcast_block:
         ENABLE_PITCHTYPE_STATCAST_BLOCK = True
+    if args.enable_pitchtype_statcast_v2:
+        ENABLE_PITCHTYPE_STATCAST_V2 = True
 
     split_info = SplitInfo(train_end_date=args.train_end_date, val_end_date=args.val_end_date)
 
@@ -2179,6 +2531,14 @@ def main() -> None:
         _write_table(pitcher_wide.reset_index(), os.path.join(OUTPUT_DIR, "pitchtype_statcast_pitcher"), OUTPUT_FORMAT)
         _write_table(batter_wide.reset_index(), os.path.join(OUTPUT_DIR, "pitchtype_statcast_batter"), OUTPUT_FORMAT)
 
+    # Compute pitch-type statcast v2 block (if enabled)
+    pitchtype_statcast_v2 = None
+    if ENABLE_PITCHTYPE_STATCAST_V2:
+        pitcher_wide_v2, batter_wide_v2 = compute_pitchtype_statcast_block_v2(INPUT_CSV, split_info)
+        pitchtype_statcast_v2 = (pitcher_wide_v2, batter_wide_v2)
+        _write_table(pitcher_wide_v2.reset_index(), os.path.join(OUTPUT_DIR, "pitchtype_statcast_v2_pitcher"), OUTPUT_FORMAT)
+        _write_table(batter_wide_v2.reset_index(), os.path.join(OUTPUT_DIR, "pitchtype_statcast_v2_batter"), OUTPUT_FORMAT)
+
     # PASS 3: Build PA-level splits with features
     transform_summary = pass3_write_pa_splits(
         INPUT_CSV,
@@ -2191,6 +2551,7 @@ def main() -> None:
         six_vector_stats,
         OUTPUT_FORMAT,
         pitchtype_statcast=pitchtype_statcast,
+        pitchtype_statcast_v2=pitchtype_statcast_v2,
     )
 
     fit = FitStats(

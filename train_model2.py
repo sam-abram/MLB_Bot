@@ -1648,11 +1648,13 @@ def main() -> None:
     _parser.add_argument("preprocessed_dir", nargs="?", default=PREPROCESSED_DIR)
     _parser.add_argument("--use_pitchtype_statcast_block", action="store_true", default=False,
                          help="Feed 90 pitch-type statcast cols into the embedding head")
+    _parser.add_argument("--use_pitchtype_statcast_v2", action="store_true", default=False,
+                         help="Feed 210 pitch-type statcast v2 cols into the embedding head")
     _parser.add_argument("--artifact_dir", type=str, default=None,
                          help="Override artifact output directory")
     _args = _parser.parse_args()
     pre_dir = _args.preprocessed_dir
-    use_pt_statcast = _args.use_pitchtype_statcast_block
+    use_pt_statcast = _args.use_pitchtype_statcast_block or _args.use_pitchtype_statcast_v2
     artifact_dir = _args.artifact_dir if _args.artifact_dir else ARTIFACT_DIR
 
     # Reproducibility
@@ -2077,6 +2079,7 @@ def main() -> None:
             ("B: Vector weights",           1.4312, 1.4689,      12,  1),
             ("C: Hybrid (prob mix)",        1.4311, 1.4719, 174_676, 13),
             ("D: Hybrid (logit mix)",       1.4307, 1.4695, 174_676, 13),
+            ("E: Hybrid + PT Statcast v1",  1.4302, 1.4674, 188_330, 32),
         ]
 
         lines = []
@@ -2096,7 +2099,7 @@ def main() -> None:
         # This run
         vp = 100.0 * (base_val - val_ll) / base_val
         tp = 100.0 * (base_test - test_ll) / base_test
-        lines.append(f"  {'E: Hybrid + PT Statcast':<35s} {n_params:>8,d} {best_epoch:>6d} {val_ll:>10.4f} {vp:>+7.2f}% {test_ll:>10.4f} {tp:>+7.02f}%")
+        lines.append(f"  {'F: Hybrid + PT Statcast v2':<35s} {n_params:>8,d} {best_epoch:>6d} {val_ll:>10.4f} {vp:>+7.2f}% {test_ll:>10.4f} {tp:>+7.02f}%")
         lines.append(dash)
         lines.append(f"  {'Base rate':<35s} {'--':>8s} {'--':>6s} {base_val:>10.4f} {'--':>8s} {base_test:>10.4f} {'--':>8s}")
         lines.append(sep)
@@ -2113,8 +2116,9 @@ def main() -> None:
                 "B_vector_weights": {"val_ll": 1.4312, "test_ll": 1.4689},
                 "C_hybrid_prob": {"val_ll": 1.4311, "test_ll": 1.4719},
                 "D_hybrid_logit": {"val_ll": 1.4307, "test_ll": 1.4695},
-                "E_hybrid_pt_statcast": {"val_ll": val_ll, "test_ll": test_ll,
-                                         "params": n_params, "best_epoch": best_epoch},
+                "E_hybrid_pt_statcast_v1": {"val_ll": 1.4302, "test_ll": 1.4674},
+                "F_hybrid_pt_statcast_v2": {"val_ll": val_ll, "test_ll": test_ll,
+                                            "params": n_params, "best_epoch": best_epoch},
             },
             "base_rate": {"val_ll": base_val, "test_ll": base_test},
         })

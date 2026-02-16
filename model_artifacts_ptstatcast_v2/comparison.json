@@ -1,0 +1,34 @@
+{
+  "models": {
+    "A_embeddings_only": {
+      "val_ll": 1.432,
+      "test_ll": 1.4688
+    },
+    "B_vector_weights": {
+      "val_ll": 1.4312,
+      "test_ll": 1.4689
+    },
+    "C_hybrid_prob": {
+      "val_ll": 1.4311,
+      "test_ll": 1.4719
+    },
+    "D_hybrid_logit": {
+      "val_ll": 1.4307,
+      "test_ll": 1.4695
+    },
+    "E_hybrid_pt_statcast_v1": {
+      "val_ll": 1.4302,
+      "test_ll": 1.4674
+    },
+    "F_hybrid_pt_statcast_v2": {
+      "val_ll": 1.430209708337339,
+      "test_ll": 1.4680917474287976,
+      "params": 228856,
+      "best_epoch": 13
+    }
+  },
+  "base_rate": {
+    "val_ll": 1.4438,
+    "test_ll": 1.4724
+  }
+}
