@@ -32,6 +32,11 @@
       "test": "preprocessed\\test.parquet"
     },
     "feature_list_ordered": [
+      "batter_id",
+      "pitcher_id",
+      "stadium_id",
+      "stand",
+      "p_throws",
       "pitcher_fatigue",
       "v1_batter_K",
       "v1_batter_BIPO",
@@ -76,7 +81,13 @@
       "v6_mix_HR",
       "v6_mix_log_n"
     ],
-    "categorical_cols": [],
+    "categorical_cols": [
+      "batter_id",
+      "pitcher_id",
+      "stadium_id",
+      "stand",
+      "p_throws"
+    ],
     "numeric_cols": [
       "pitcher_fatigue",
       "v1_batter_K",
@@ -122,8 +133,20 @@
       "v6_mix_HR",
       "v6_mix_log_n"
     ],
-    "categorical_vocab_sizes": {},
-    "embedding_dims": {},
+    "categorical_vocab_sizes": {
+      "batter_id": 1961,
+      "pitcher_id": 1716,
+      "stadium_id": 32,
+      "stand": 4,
+      "p_throws": 4
+    },
+    "embedding_dims": {
+      "batter_id": 32,
+      "pitcher_id": 32,
+      "stadium_id": 16,
+      "stand": 4,
+      "p_throws": 4
+    },
     "num_classes": 6,
     "label_set_ordered": [
       "K",
@@ -134,8 +157,8 @@
       "HR"
     ],
     "tendency_artifact_paths": {},
-    "model_class": "PitchOutcomeModel",
+    "model_class": "HybridModel",
     "interaction_dim": 0
   },
-  "timestamp": "2026-02-08 12:58:40"
+  "timestamp": "2026-02-15 15:05:11"
 }

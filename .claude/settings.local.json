@@ -13,7 +13,10 @@
       "Bash(git push:*)",
       "Bash(git filter-repo:*)",
       "Bash(git reset:*)",
-      "Bash(del /Q preprocessed*.parquet preprocessed*.json)"
+      "Bash(del /Q preprocessed*.parquet preprocessed*.json)",
+      "Bash(.csv)",
+      "Bash(.parquet \")",
+      "Bash(dir:*)"
     ]
   }
 }

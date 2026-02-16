@@ -1,15 +1,32 @@
 {
-  "created_at_utc": "2026-02-08T17:58:20.998848Z",
+  "created_at_utc": "2026-02-15T20:03:37.714921Z",
   "feature_toggles": {
     "ENABLE_BUCKET_FEATURES": false,
-    "ENABLE_EMBEDDINGS": false,
+    "ENABLE_EMBEDDINGS": true,
     "ENABLE_PARK_FACTORS": false,
     "ENABLE_SIX_VECTORS": true
   },
   "features": {
-    "categorical_features": [],
-    "categorical_vocab_sizes": {},
+    "categorical_features": [
+      "batter_id",
+      "pitcher_id",
+      "stadium_id",
+      "stand",
+      "p_throws"
+    ],
+    "categorical_vocab_sizes": {
+      "batter_id": 1961,
+      "p_throws": 4,
+      "pitcher_id": 1716,
+      "stadium_id": 32,
+      "stand": 4
+    },
     "feature_list_ordered": [
+      "batter_id",
+      "pitcher_id",
+      "stadium_id",
+      "stand",
+      "p_throws",
       "pitcher_fatigue",
       "v1_batter_K",
       "v1_batter_BIPO",

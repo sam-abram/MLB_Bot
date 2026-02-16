@@ -80,8 +80,9 @@ GRAD_CLIP_NORM = 1.0
 # =========================
 # Architecture Options
 # =========================
-USE_SIMPLE_VECTOR_WEIGHTS = True  # Disable for embedding experiment
+USE_SIMPLE_VECTOR_WEIGHTS = False  # Disable for hybrid experiment
 USE_EMBEDDING_INTERACTIONS = False  # Standard concat for clean comparison
+USE_HYBRID_MODEL = True  # Hybrid: learnable a*emb_probs + b*vec_probs
 
 # Embedding dimensions (must match for interaction)
 BATTER_EMBED_DIM = 32
@@ -1056,6 +1057,129 @@ class SimpleVectorWeightModel(nn.Module):
         }
 
 
+class HybridModel(nn.Module):
+    """
+    Hybrid model: learns a = softmax(raw_ab)[0], b = softmax(raw_ab)[1]
+    such that combined_probs = a * emb_probs + b * vec_probs.
+
+    Embedding head: categorical embeddings -> MLP -> softmax -> 6 probs
+    Vector head: weighted sum of 6 probability vectors (like SimpleVectorWeightModel)
+    """
+
+    def __init__(
+        self,
+        cat_cols: List[str],
+        num_numeric: int,
+        vocab_sizes: Dict[str, int],
+        num_classes: int,
+        hidden_dims: List[int],
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.cat_cols = list(cat_cols)
+        self.num_classes = int(num_classes)
+
+        # --- Embedding head ---
+        self.embeddings = nn.ModuleDict()
+        self.emb_dims: Dict[str, int] = {}
+        emb_out_dim = 0
+        for col in self.cat_cols:
+            vs = int(vocab_sizes[col])
+            ed = _choose_emb_dim(col, vs)
+            self.emb_dims[col] = ed
+            self.embeddings[col] = nn.Embedding(
+                num_embeddings=vs, embedding_dim=ed, padding_idx=PAD_NA_ID
+            )
+            emb_out_dim += ed
+        self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
+
+        # Embedding MLP: embeddings -> hidden -> num_classes (logits)
+        emb_layers: List[nn.Module] = []
+        prev = emb_out_dim
+        for h in hidden_dims:
+            emb_layers.append(nn.Linear(prev, int(h)))
+            emb_layers.append(nn.ReLU())
+            emb_layers.append(nn.Dropout(float(dropout)))
+            prev = int(h)
+        emb_layers.append(nn.Linear(prev, self.num_classes))
+        self.emb_mlp = nn.Sequential(*emb_layers)
+
+        # --- Vector head (same as SimpleVectorWeightModel with log_n) ---
+        self.num_vectors = 6
+        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+
+        # --- Combination weights: a (embedding), b (vector) ---
+        self.raw_ab = nn.Parameter(torch.zeros(2))
+
+        # Log architecture
+        print(f"[MODEL] HybridModel:")
+        print(f"  Embedding head: {self.emb_dims} -> MLP {hidden_dims} -> {self.num_classes}")
+        print(f"  Vector head: {self.num_vectors} vectors with log_n weighting")
+        print(f"  Combination: softmax(raw_ab) -> a*emb_probs + b*vec_probs")
+
+    def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor) -> torch.Tensor:
+        # --- Embedding head ---
+        emb_parts: List[torch.Tensor] = []
+        for i, col in enumerate(self.cat_cols):
+            ids = x_cat[:, i]
+            vs = self.vocab_sizes[col]
+            ids = torch.clamp(ids, min=0, max=vs - 1)
+            emb_parts.append(self.embeddings[col](ids))
+        emb_concat = torch.cat(emb_parts, dim=1)
+        emb_logits = self.emb_mlp(emb_concat)
+        emb_probs = torch.softmax(emb_logits, dim=1)  # (B, 6)
+
+        # --- Vector head ---
+        # Feature layout: [pitcher_fatigue, v1(6+1), v2(6+1), ..., v6(6+1)]
+        v1 = x_num[:, 1:7]
+        v2 = x_num[:, 8:14]
+        v3 = x_num[:, 15:21]
+        v4 = x_num[:, 22:28]
+        v5 = x_num[:, 29:35]
+        v6 = x_num[:, 36:42]
+
+        vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)  # (B, 6, 6)
+
+        log_n = torch.stack([
+            x_num[:, 7], x_num[:, 14], x_num[:, 21],
+            x_num[:, 28], x_num[:, 35], x_num[:, 42],
+        ], dim=1)  # (B, 6)
+
+        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
+        vec_weights = torch.softmax(adjusted, dim=1)  # (B, 6)
+        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+
+        # --- Combine ---
+        ab = torch.softmax(self.raw_ab, dim=0)  # (2,)
+        combined_probs = ab[0] * emb_probs + ab[1] * vec_probs  # (B, 6)
+
+        logits = torch.log(combined_probs + 1e-8)
+        return logits
+
+    def get_learned_weights(self) -> Dict[str, float]:
+        """Return the learned vector head weights (v1-v6)."""
+        with torch.no_grad():
+            weights = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+        return {
+            "v1_batter_overall": float(weights[0]),
+            "v2_pitcher_overall": float(weights[1]),
+            "v3_stadium": float(weights[2]),
+            "v4_batter_platoon": float(weights[3]),
+            "v5_pitcher_platoon": float(weights[4]),
+            "v6_pitch_mix": float(weights[5]),
+        }
+
+    def get_ab_weights(self) -> Dict[str, float]:
+        """Return the learned a (embedding) and b (vector) combination weights."""
+        with torch.no_grad():
+            ab = torch.softmax(self.raw_ab, dim=0).cpu().numpy()
+        return {
+            "a_embedding": float(ab[0]),
+            "b_vector": float(ab[1]),
+        }
+
+
 # -----------------------------
 # Training / Evaluation
 # -----------------------------
@@ -1518,7 +1642,17 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=None, num_workers=NUM_WORKERS)
 
     # Build model
-    if USE_SIMPLE_VECTOR_WEIGHTS and len(cat_cols) == 0:
+    if USE_HYBRID_MODEL and len(cat_cols) > 0:
+        print("[CONFIG] Using hybrid model (embeddings + vectors with learnable a,b)")
+        model = HybridModel(
+            cat_cols=cat_cols,
+            num_numeric=len(num_cols),
+            vocab_sizes=vocab_sizes,
+            num_classes=num_classes,
+            hidden_dims=HIDDEN_DIMS,
+            dropout=DROPOUT,
+        ).to(DEVICE)
+    elif USE_SIMPLE_VECTOR_WEIGHTS and len(cat_cols) == 0:
         print("[CONFIG] Using simple weighted vector combination model")
         model = SimpleVectorWeightModel(
             num_vectors=6,
@@ -1713,7 +1847,7 @@ def main() -> None:
             "num_classes": num_classes,
             "label_set_ordered": label_set_ordered,
             "tendency_artifact_paths": tendency_artifact_paths,
-            "model_class": "PitchOutcomeModelWithInteractions" if USE_EMBEDDING_INTERACTIONS else "PitchOutcomeModel",
+            "model_class": "HybridModel" if USE_HYBRID_MODEL else ("PitchOutcomeModelWithInteractions" if USE_EMBEDDING_INTERACTIONS else "PitchOutcomeModel"),
             "interaction_dim": BATTER_EMBED_DIM if USE_EMBEDDING_INTERACTIONS else 0,
         },
         "timestamp": _now_str(),
@@ -1742,7 +1876,7 @@ def main() -> None:
         "timestamp": _now_str(),
     }
 
-    # Log learned vector weights (if using simple model)
+    # Log learned vector weights (if using simple or hybrid model)
     if hasattr(model, 'get_learned_weights'):
         learned_weights = model.get_learned_weights()
         print("\n" + "=" * 50)
@@ -1752,6 +1886,17 @@ def main() -> None:
             print(f"  {name}: {weight:.4f} ({weight*100:.1f}%)")
         print("=" * 50 + "\n")
         metrics["learned_vector_weights"] = learned_weights
+
+    # Log hybrid a,b combination weights
+    if hasattr(model, 'get_ab_weights'):
+        ab_weights = model.get_ab_weights()
+        print("=" * 50)
+        print("LEARNED COMBINATION WEIGHTS (a*emb + b*vec):")
+        print("=" * 50)
+        for name, weight in ab_weights.items():
+            print(f"  {name}: {weight:.4f} ({weight*100:.1f}%)")
+        print("=" * 50 + "\n")
+        metrics["hybrid_ab_weights"] = ab_weights
 
     _write_json(os.path.join(ARTIFACT_DIR, "metrics.json"), metrics)
 
