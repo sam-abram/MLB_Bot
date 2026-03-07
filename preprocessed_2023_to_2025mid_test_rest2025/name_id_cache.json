@@ -1,0 +1,35 @@
+{
+  "batters": {
+    "juan soto": {
+      "id": 665742,
+      "name": "Juan Soto"
+    },
+    "aaron judge": {
+      "id": 592450,
+      "name": "Aaron Judge"
+    }
+  },
+  "pitchers": {
+    "gerrit cole": {
+      "id": 543037,
+      "name": "Gerrit Cole"
+    },
+    "tarik skubal": {
+      "id": 669373,
+      "name": "Tarik Skubal"
+    },
+    "clay holmes": {
+      "id": 605280,
+      "name": "Clay Holmes"
+    },
+    "adrian houser": {
+      "id": 605288,
+      "name": "Adrian Houser"
+    },
+    "jameson taillon": {
+      "id": 592791,
+      "name": "Jameson Taillon"
+    }
+  },
+  "built": true
+}

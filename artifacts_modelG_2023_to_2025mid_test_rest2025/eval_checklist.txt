@@ -1,0 +1,49 @@
+==================================================================
+  MODEL G DEPLOYMENT CHECKLIST
+  Model:  ContextualGateLogitHybridModel
+  Prepr:  preprocessed_2023_to_2025mid_test_rest2025
+  Artif:  artifacts_modelG_2023_to_2025mid_test_rest2025
+==================================================================
+
+--- OVERALL PERFORMANCE ---
+  VAL    logloss=1.42424  base=1.43996  vs_base=+1.09%  acc=46.8%  n=15,750
+  TEST   logloss=1.43191  base=1.44427  vs_base=+0.86%  acc=46.1%  n=86,699
+
+--- BOOTSTRAP SIGNIFICANCE (TEST, 95% CI) ---
+  Mean delta NLL  : -0.01236  (negative = model better)
+  95% CI          : [-0.01374, -0.01094]
+  Significant@95% : YES  (P(model worse)=0.000)
+  Mean improvement: +0.856% vs base rate
+
+--- CALIBRATION ---
+  VAL    ECE=0.00545  Brier=0.69500
+  TEST   ECE=0.01000  Brier=0.69906
+
+--- V1 BATTER LOG N DECILE LOGLOSS (TEST) ---
+  decile=0  n= 8670  ll=1.45102
+  decile=1  n= 8913  ll=1.40363
+  decile=2  n= 8501  ll=1.40837
+  decile=3  n= 8809  ll=1.40822
+  decile=4  n= 8573  ll=1.43650
+  decile=5  n= 8661  ll=1.42076
+  decile=6  n= 8623  ll=1.44215
+  decile=7  n= 8716  ll=1.45300
+  decile=8  n= 8890  ll=1.41994
+  decile=9  n= 8343  ll=1.47827
+
+--- V2 PITCHER LOG N DECILE LOGLOSS (TEST) ---
+  decile=0  n= 8687  ll=1.47707
+  decile=1  n= 8653  ll=1.45112
+  decile=2  n= 8946  ll=1.45669
+  decile=3  n= 8397  ll=1.42753
+  decile=4  n= 8681  ll=1.41732
+  decile=5  n= 8861  ll=1.41373
+  decile=6  n= 8520  ll=1.41701
+  decile=7  n= 8697  ll=1.41951
+  decile=8  n= 8637  ll=1.39326
+  decile=9  n= 8620  ll=1.44500
+
+--- PITCH MIX ENTROPY DECILE LOGLOSS (TEST) ---
+
+  [Elapsed: 1.1s]
+==================================================================
