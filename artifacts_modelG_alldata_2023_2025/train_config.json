@@ -80,6 +80,9 @@
       "v6_mix_XBH",
       "v6_mix_HR",
       "v6_mix_log_n",
+      "ext_max_abs_dev",
+      "ext_mean_abs_dev",
+      "ext_vector_disagreement",
       "pitcher_pitch_rate_FF",
       "pitcher_FF_release_speed",
       "pitcher_FF_release_spin_rate",
@@ -222,6 +225,9 @@
       "v6_mix_XBH",
       "v6_mix_HR",
       "v6_mix_log_n",
+      "ext_max_abs_dev",
+      "ext_mean_abs_dev",
+      "ext_vector_disagreement",
       "pitcher_pitch_rate_FF",
       "pitcher_FF_release_speed",
       "pitcher_FF_release_spin_rate",
@@ -340,5 +346,13 @@
     "model_class": "ContextualGateLogitHybridModel",
     "interaction_dim": 0
   },
-  "timestamp": "2026-03-07 12:43:03"
+  "league_logodds": [
+    -1.234787167046206,
+    -0.1647309496861985,
+    -2.2481629738584847,
+    -1.7962680102809647,
+    -3.00614579325087,
+    -3.449552788193959
+  ],
+  "timestamp": "2026-03-08 15:28:01"
 }

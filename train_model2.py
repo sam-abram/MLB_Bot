@@ -998,8 +998,8 @@ class SimpleVectorWeightModel(nn.Module):
         else:
             self.register_buffer('league_logodds', torch.zeros(num_outcomes, dtype=torch.float32))
 
-        # Initialize to equal weights (zeros -> softmax -> 1/6 each)
-        self.raw_weights = nn.Parameter(torch.zeros(num_vectors))
+        # Initialize to sigmoid(logit(1/6)) = 1/6 each (logit(1/6) = log(1/5) ≈ -1.609)
+        self.raw_weights = nn.Parameter(torch.full((num_vectors,), math.log(1.0 / 5.0)))
 
         if use_log_n_weighting:
             self.log_n_scale = nn.Parameter(torch.zeros(num_vectors))
@@ -1041,9 +1041,9 @@ class SimpleVectorWeightModel(nn.Module):
                 x_num[:, 28], x_num[:, 35], x_num[:, 42],
             ], dim=1)  # (batch_size, 6)
             adjusted = self.raw_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-            weights = torch.softmax(adjusted, dim=1)  # (batch_size, 6)
+            weights = torch.sigmoid(adjusted)  # (batch_size, 6)
         else:
-            weights = torch.softmax(self.raw_weights, dim=0)  # (6,)
+            weights = torch.sigmoid(self.raw_weights)  # (6,)
             weights = weights.unsqueeze(0).expand(batch_size, -1)  # (batch_size, 6)
 
         # Weighted sum of log-odds deviations, then add league baseline
@@ -1053,7 +1053,7 @@ class SimpleVectorWeightModel(nn.Module):
 
     def get_learned_weights(self) -> Dict[str, float]:
         with torch.no_grad():
-            weights = torch.softmax(self.raw_weights, dim=0).cpu().numpy()
+            weights = torch.sigmoid(self.raw_weights).cpu().numpy()
         return {
             "v1_batter_overall": float(weights[0]),
             "v2_pitcher_overall": float(weights[1]),
@@ -1119,7 +1119,7 @@ class HybridModel(nn.Module):
 
         # --- Vector head (same as SimpleVectorWeightModel with log_n) ---
         self.num_vectors = 6
-        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
         self.vec_norm = nn.LayerNorm(self.num_classes)
 
@@ -1162,7 +1162,7 @@ class HybridModel(nn.Module):
         ], dim=1)  # (B, 6)
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.softmax(adjusted, dim=1)  # (B, 6)
+        vec_weights = torch.sigmoid(adjusted)  # (B, 6)
         combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
@@ -1174,7 +1174,7 @@ class HybridModel(nn.Module):
     def get_learned_weights(self) -> Dict[str, float]:
         """Return the learned vector head weights (v1-v6)."""
         with torch.no_grad():
-            weights = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+            weights = torch.sigmoid(self.raw_vec_weights).cpu().numpy()
         return {
             "v1_batter_overall": float(weights[0]),
             "v2_pitcher_overall": float(weights[1]),
@@ -1255,7 +1255,7 @@ class StatcastLogitHybridModel(nn.Module):
 
         # --- Vector head (unchanged) ---
         self.num_vectors = 6
-        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
         self.vec_norm = nn.LayerNorm(self.num_classes)
 
@@ -1300,7 +1300,7 @@ class StatcastLogitHybridModel(nn.Module):
         ], dim=1)
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.softmax(adjusted, dim=1)
+        vec_weights = torch.sigmoid(adjusted)
         combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
@@ -1312,7 +1312,7 @@ class StatcastLogitHybridModel(nn.Module):
 
     def get_learned_weights(self) -> Dict[str, float]:
         with torch.no_grad():
-            w = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+            w = torch.sigmoid(self.raw_vec_weights).cpu().numpy()
         return {
             "v1_batter_overall": float(w[0]),
             "v2_pitcher_overall": float(w[1]),
@@ -1404,7 +1404,7 @@ class ContextualGateLogitHybridModel(nn.Module):
 
         # --- Vector head (unchanged) ---
         self.num_vectors = 6
-        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
         self.vec_norm = nn.LayerNorm(self.num_classes)
 
@@ -1496,7 +1496,7 @@ class ContextualGateLogitHybridModel(nn.Module):
         ], dim=1)
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.softmax(adjusted, dim=1)
+        vec_weights = torch.sigmoid(adjusted)
         combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
@@ -1512,7 +1512,7 @@ class ContextualGateLogitHybridModel(nn.Module):
 
     def get_learned_weights(self) -> Dict[str, float]:
         with torch.no_grad():
-            w = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+            w = torch.sigmoid(self.raw_vec_weights).cpu().numpy()
         return {
             "v1_batter_overall": float(w[0]),
             "v2_pitcher_overall": float(w[1]),
@@ -1635,7 +1635,7 @@ class PerClassGateLogitHybridModel(nn.Module):
 
         # --- Vector head (unchanged) ---
         self.num_vectors = 6
-        self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
+        self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
         self.vec_norm = nn.LayerNorm(self.num_classes)
 
@@ -1701,7 +1701,7 @@ class PerClassGateLogitHybridModel(nn.Module):
         ], dim=1)
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.softmax(adjusted, dim=1)
+        vec_weights = torch.sigmoid(adjusted)
         combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
@@ -1731,7 +1731,7 @@ class PerClassGateLogitHybridModel(nn.Module):
 
     def get_learned_weights(self) -> Dict[str, float]:
         with torch.no_grad():
-            w = torch.softmax(self.raw_vec_weights, dim=0).cpu().numpy()
+            w = torch.sigmoid(self.raw_vec_weights).cpu().numpy()
         return {
             "v1_batter_overall": float(w[0]),
             "v2_pitcher_overall": float(w[1]),
@@ -2145,15 +2145,19 @@ def main() -> None:
                          help="Use contextual gate g(x) for logit-space mixing instead of global a,b")
     _parser.add_argument("--use_per_class_gate_logit", action="store_true", default=False,
                          help="Use per-class contextual gate g_k(x) with disagreement features")
+    _parser.add_argument("--vector_only", action="store_true", default=False,
+                         help="Use vector-only model (no embedding head, no statcast)")
     _parser.add_argument("--artifact_dir", type=str, default=None,
                          help="Override artifact output directory")
     _args = _parser.parse_args()
     pre_dir = _args.preprocessed_dir
-    use_pt_statcast = (_args.use_pitchtype_statcast_block or _args.use_pitchtype_statcast_v2
-                       or _args.use_contextual_gate_logit or _args.use_per_class_gate_logit)
-    use_contextual_gate = _args.use_contextual_gate_logit
-    use_per_class_gate = _args.use_per_class_gate_logit
+    use_pt_statcast = (not _args.vector_only and
+                       (_args.use_pitchtype_statcast_block or _args.use_pitchtype_statcast_v2
+                        or _args.use_contextual_gate_logit or _args.use_per_class_gate_logit))
+    use_contextual_gate = _args.use_contextual_gate_logit and not _args.vector_only
+    use_per_class_gate = _args.use_per_class_gate_logit and not _args.vector_only
     artifact_dir = _args.artifact_dir if _args.artifact_dir else ARTIFACT_DIR
+    vector_only = _args.vector_only
 
     # Reproducibility
     np.random.seed(SEED)
@@ -2342,6 +2346,14 @@ def main() -> None:
             hidden_dims=HIDDEN_DIMS,
             dropout=DROPOUT,
             num_pt_statcast_cols=num_pt_statcast,
+            league_logodds=league_logodds,
+        ).to(DEVICE)
+    elif vector_only:
+        print("[CONFIG] vector_only=True: Using SimpleVectorWeightModel (no embedding head)")
+        model = SimpleVectorWeightModel(
+            num_vectors=6,
+            num_outcomes=num_classes,
+            use_log_n_weighting=True,
             league_logodds=league_logodds,
         ).to(DEVICE)
     elif USE_HYBRID_MODEL and len(cat_cols) > 0:
@@ -2621,9 +2633,12 @@ def main() -> None:
         print(f"\n  Val  g(x): mean={val_gate_stats['mean']:.4f}, std={val_gate_stats['std']:.4f}, "
               f"[p5={val_gate_stats['p5']:.4f}, p25={val_gate_stats['p25']:.4f}, "
               f"p50={val_gate_stats['p50']:.4f}, p75={val_gate_stats['p75']:.4f}, p95={val_gate_stats['p95']:.4f}]")
-        print(f"  Test g(x): mean={test_gate_stats['mean']:.4f}, std={test_gate_stats['std']:.4f}, "
-              f"[p5={test_gate_stats['p5']:.4f}, p25={test_gate_stats['p25']:.4f}, "
-              f"p50={test_gate_stats['p50']:.4f}, p75={test_gate_stats['p75']:.4f}, p95={test_gate_stats['p95']:.4f}]")
+        if test_gate_stats.get('mean') is not None:
+            print(f"  Test g(x): mean={test_gate_stats['mean']:.4f}, std={test_gate_stats['std']:.4f}, "
+                  f"[p5={test_gate_stats['p5']:.4f}, p25={test_gate_stats['p25']:.4f}, "
+                  f"p50={test_gate_stats['p50']:.4f}, p75={test_gate_stats['p75']:.4f}, p95={test_gate_stats['p95']:.4f}]")
+        else:
+            print("  Test g(x): N/A (no test split)")
         metrics["gate_stats_val"] = val_gate_stats
         metrics["gate_stats_test"] = test_gate_stats
 

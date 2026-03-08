@@ -1,5 +1,5 @@
 {
-  "created_at_utc": "2026-03-07T17:39:51.040602Z",
+  "created_at_utc": "2026-03-08T19:25:27.337939Z",
   "feature_toggles": {
     "ENABLE_BUCKET_FEATURES": false,
     "ENABLE_EMBEDDINGS": true,
@@ -72,6 +72,9 @@
       "v6_mix_XBH",
       "v6_mix_HR",
       "v6_mix_log_n",
+      "ext_max_abs_dev",
+      "ext_mean_abs_dev",
+      "ext_vector_disagreement",
       "pitcher_pitch_rate_FF",
       "pitcher_FF_release_speed",
       "pitcher_FF_release_spin_rate",
@@ -208,6 +211,9 @@
       "v6_mix_XBH",
       "v6_mix_HR",
       "v6_mix_log_n",
+      "ext_max_abs_dev",
+      "ext_mean_abs_dev",
+      "ext_vector_disagreement",
       "pitcher_pitch_rate_FF",
       "pitcher_FF_release_speed",
       "pitcher_FF_release_spin_rate",
