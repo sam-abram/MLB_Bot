@@ -104,6 +104,7 @@ USE_SMOOTHING = False           # NO smoothing - raw rates only
 TENDENCY_ALPHA = 0.0            # Alpha = 0 means no shrinkage toward prior
 TENDENCY_DIRICHLET_ALPHA = 2.0  # alias for backward compat (old bucket system)
 MEAN_SHRINK_K = 50.0
+SHRINKAGE_K = 150               # PA-equivalents of prior weight for Bayesian shrinkage
 
 # Feature toggles for ablation experiments
 ENABLE_SIX_VECTORS = True       # Six-vector interpretable features (42)
@@ -1039,20 +1040,23 @@ def pass2_compute_six_vector_stats(
 
     def _compute_rates(counts, n, league_rates):
         """
-        Compute outcome rates WITHOUT smoothing.
+        Bayesian shrinkage toward league average.
 
-        - If n > 0: return raw rates (counts / n)
-        - If n = 0: return league average (fallback for unseen players)
+        With k=150, a player needs ~150 PAs before their rates are weighted
+        equally with the prior. This means:
+        - 8-PA player:   ~95% league average, ~5% observed
+        - 50-PA player:  ~75% league, ~25% observed
+        - 150-PA player: ~50/50
+        - 600-PA player: ~20% league, ~80% observed
 
-        No Dirichlet smoothing. The model uses log_n to learn weighting.
+        The shrinkage naturally bounds log-odds deviations by sample size,
+        eliminating the need for LayerNorm or log_n_scale on the vector head.
         """
-        if n > 0:
-            rates = counts / n
-            total = rates.sum()
-            if total > 0:
-                rates = rates / total
-            else:
-                rates = league_rates.copy()
+        k = SHRINKAGE_K
+        rates = (counts + k * league_rates) / (n + k)
+        total = rates.sum()
+        if total > 0:
+            rates = rates / total
         else:
             rates = league_rates.copy()
         return rates

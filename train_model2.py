@@ -989,7 +989,6 @@ class SimpleVectorWeightModel(nn.Module):
         self.num_vectors = num_vectors
         self.num_outcomes = num_outcomes
         self.num_classes = num_outcomes
-        self.use_log_n_weighting = use_log_n_weighting
         self.cat_cols: List[str] = []
         self.emb_dims: Dict[str, int] = {}
 
@@ -1001,15 +1000,10 @@ class SimpleVectorWeightModel(nn.Module):
         # Initialize to sigmoid(logit(1/6)) = 1/6 each (logit(1/6) = log(1/5) ≈ -1.609)
         self.raw_weights = nn.Parameter(torch.full((num_vectors,), math.log(1.0 / 5.0)))
 
-        if use_log_n_weighting:
-            self.log_n_scale = nn.Parameter(torch.zeros(num_vectors))
-        self.vec_norm = nn.LayerNorm(self.num_classes)
-
-        n_params = num_vectors + (num_vectors if use_log_n_weighting else 0)
+        n_params = num_vectors
         print(f"[MODEL] SimpleVectorWeightModel:")
         print(f"  Num vectors: {num_vectors}")
         print(f"  Num outcomes: {num_outcomes}")
-        print(f"  Use log_n weighting: {use_log_n_weighting}")
         print(f"  Total parameters: {n_params}")
 
     def forward(self, x_cat: torch.Tensor, x_num: torch.Tensor) -> torch.Tensor:
@@ -1032,22 +1026,10 @@ class SimpleVectorWeightModel(nn.Module):
 
         # Stack: (batch_size, 6_vectors, 6_outcomes)
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
-        B, V, C = vectors.shape
-        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
-        if self.use_log_n_weighting:
-            log_n = torch.stack([
-                x_num[:, 7], x_num[:, 14], x_num[:, 21],
-                x_num[:, 28], x_num[:, 35], x_num[:, 42],
-            ], dim=1)  # (batch_size, 6)
-            adjusted = self.raw_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-            weights = torch.sigmoid(adjusted)  # (batch_size, 6)
-        else:
-            weights = torch.sigmoid(self.raw_weights)  # (6,)
-            weights = weights.unsqueeze(0).expand(batch_size, -1)  # (batch_size, 6)
-
-        # Weighted sum of log-odds deviations, then add league baseline
-        combined_deviation = (vectors * weights.unsqueeze(2)).sum(dim=1)  # (batch_size, 6)
+        # Global sigmoid weights, broadcast over batch and outcomes
+        vec_weights = torch.sigmoid(self.raw_weights)  # (6,)
+        combined_deviation = (vectors * vec_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (batch_size, 6)
         logits = self.league_logodds.unsqueeze(0) + combined_deviation
         return logits
 
@@ -1117,11 +1099,9 @@ class HybridModel(nn.Module):
         emb_layers.append(nn.Linear(prev, self.num_classes))
         self.emb_mlp = nn.Sequential(*emb_layers)
 
-        # --- Vector head (same as SimpleVectorWeightModel with log_n) ---
+        # --- Vector head ---
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
-        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
-        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Combination weights: a (embedding), b (vector) ---
         self.raw_ab = nn.Parameter(torch.zeros(2))
@@ -1153,17 +1133,9 @@ class HybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)  # (B, 6, 6)
-        B, V, C = vectors.shape
-        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
-        log_n = torch.stack([
-            x_num[:, 7], x_num[:, 14], x_num[:, 21],
-            x_num[:, 28], x_num[:, 35], x_num[:, 42],
-        ], dim=1)  # (B, 6)
-
-        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.sigmoid(adjusted)  # (B, 6)
-        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_weights = torch.sigmoid(self.raw_vec_weights)  # (6,)
+        combined_deviation = (vectors * vec_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Combine in logit space ---
@@ -1253,11 +1225,9 @@ class StatcastLogitHybridModel(nn.Module):
         emb_layers.append(nn.Linear(prev, self.num_classes))
         self.emb_mlp = nn.Sequential(*emb_layers)
 
-        # --- Vector head (unchanged) ---
+        # --- Vector head ---
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
-        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
-        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Combination weights ---
         self.raw_ab = nn.Parameter(torch.zeros(2))
@@ -1291,17 +1261,9 @@ class StatcastLogitHybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
-        B, V, C = vectors.shape
-        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
-        log_n = torch.stack([
-            x_num[:, 7], x_num[:, 14], x_num[:, 21],
-            x_num[:, 28], x_num[:, 35], x_num[:, 42],
-        ], dim=1)
-
-        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.sigmoid(adjusted)
-        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_weights = torch.sigmoid(self.raw_vec_weights)  # (6,)
+        combined_deviation = (vectors * vec_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Combine in logit space ---
@@ -1402,11 +1364,9 @@ class ContextualGateLogitHybridModel(nn.Module):
         emb_layers.append(nn.Linear(prev, self.num_classes))
         self.emb_mlp = nn.Sequential(*emb_layers)
 
-        # --- Vector head (unchanged) ---
+        # --- Vector head ---
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
-        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
-        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Contextual gate: 3 features -> scalar in [0,1] ---
         gate_input_dim = 3
@@ -1487,17 +1447,9 @@ class ContextualGateLogitHybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
-        B, V, C = vectors.shape
-        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
-        log_n = torch.stack([
-            x_num[:, 7], x_num[:, 14], x_num[:, 21],
-            x_num[:, 28], x_num[:, 35], x_num[:, 42],
-        ], dim=1)
-
-        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.sigmoid(adjusted)
-        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_weights = torch.sigmoid(self.raw_vec_weights)  # (6,)
+        combined_deviation = (vectors * vec_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Contextual gate ---
@@ -1633,11 +1585,9 @@ class PerClassGateLogitHybridModel(nn.Module):
         emb_layers.append(nn.Linear(prev, self.num_classes))
         self.emb_mlp = nn.Sequential(*emb_layers)
 
-        # --- Vector head (unchanged) ---
+        # --- Vector head ---
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.full((self.num_vectors,), math.log(1.0 / 5.0)))
-        self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
-        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Per-class gate network ---
         # Input: abs_delta(6) + ent_vec(1) + ent_emb(1) + delta_l2(1) = 9
@@ -1692,17 +1642,9 @@ class PerClassGateLogitHybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
-        B, V, C = vectors.shape
-        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
-        log_n = torch.stack([
-            x_num[:, 7], x_num[:, 14], x_num[:, 21],
-            x_num[:, 28], x_num[:, 35], x_num[:, 42],
-        ], dim=1)
-
-        adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
-        vec_weights = torch.sigmoid(adjusted)
-        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_weights = torch.sigmoid(self.raw_vec_weights)  # (6,)
+        combined_deviation = (vectors * vec_weights.unsqueeze(0).unsqueeze(-1)).sum(dim=1)  # (B, 6)
         vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Per-class contextual gate ---
