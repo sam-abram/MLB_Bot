@@ -1220,12 +1220,19 @@ def pass2_compute_six_vector_stats(
         "batter_pitch_type": batter_pitch_type_df,
         "pitcher_mix": pitcher_mix_df,
         "league_rates": league_rates,
+        "league_logodds": _safe_logit(league_rates),
     }
 
 
 # =========================
 # Six-vector PA-level feature computation
 # =========================
+
+def _safe_logit(p, eps=1e-6):
+    """Clamp and compute log-odds: log(p / (1-p)). Works on numpy arrays and scalars."""
+    p_clamped = np.clip(p, eps, 1.0 - eps)
+    return np.log(p_clamped / (1.0 - p_clamped))
+
 
 def compute_six_vectors(
     pa_chunk: pd.DataFrame,
@@ -1238,6 +1245,7 @@ def compute_six_vectors(
     Total: 6 vectors x 7 = 42 features.
     """
     league_rates = stats["league_rates"]
+    league_logodds = _safe_logit(league_rates)  # shape (6,), log-odds of league baseline
 
     # Build indexed lookup tables
     batter_overall = stats["batter_overall"].set_index("batter_id")
@@ -1272,7 +1280,8 @@ def compute_six_vectors(
     # =====================================================
     for oi, outcome in enumerate(OUTCOMES):
         col = f"batter_{outcome}_rate"
-        features[f"v1_batter_{outcome}"] = batter_overall_rows[col].fillna(league_rates[oi]).values.astype(np.float32)
+        raw_rate = batter_overall_rows[col].fillna(league_rates[oi]).values
+        features[f"v1_batter_{outcome}"] = (_safe_logit(raw_rate) - league_logodds[oi]).astype(np.float32)
     features["v1_batter_log_n"] = np.log1p(batter_overall_rows["batter_n_pa"].fillna(0).values).astype(np.float32)
 
     # =====================================================
@@ -1280,7 +1289,8 @@ def compute_six_vectors(
     # =====================================================
     for oi, outcome in enumerate(OUTCOMES):
         col = f"pitcher_{outcome}_rate"
-        features[f"v2_pitcher_{outcome}"] = pitcher_overall_rows[col].fillna(league_rates[oi]).values.astype(np.float32)
+        raw_rate = pitcher_overall_rows[col].fillna(league_rates[oi]).values
+        features[f"v2_pitcher_{outcome}"] = (_safe_logit(raw_rate) - league_logodds[oi]).astype(np.float32)
     features["v2_pitcher_log_n"] = np.log1p(pitcher_overall_rows["pitcher_n_pa"].fillna(0).values).astype(np.float32)
 
     # =====================================================
@@ -1288,7 +1298,8 @@ def compute_six_vectors(
     # =====================================================
     for oi, outcome in enumerate(OUTCOMES):
         col = f"stadium_{outcome}_rate"
-        features[f"v3_stadium_{outcome}"] = stadium_rows[col].fillna(league_rates[oi]).values.astype(np.float32)
+        raw_rate = stadium_rows[col].fillna(league_rates[oi]).values
+        features[f"v3_stadium_{outcome}"] = (_safe_logit(raw_rate) - league_logodds[oi]).astype(np.float32)
     features["v3_stadium_log_n"] = np.log1p(stadium_rows["stadium_n_pa"].fillna(0).values).astype(np.float32)
 
     # =====================================================
@@ -1297,9 +1308,8 @@ def compute_six_vectors(
     for oi, outcome in enumerate(OUTCOMES):
         vs_L = batter_platoon_rows[f"batter_{outcome}_vs_L"].fillna(league_rates[oi]).values
         vs_R = batter_platoon_rows[f"batter_{outcome}_vs_R"].fillna(league_rates[oi]).values
-        features[f"v4_batter_platoon_{outcome}"] = np.where(
-            p_throws == "L", vs_L, vs_R
-        ).astype(np.float32)
+        raw_rate = np.where(p_throws == "L", vs_L, vs_R)
+        features[f"v4_batter_platoon_{outcome}"] = (_safe_logit(raw_rate) - league_logodds[oi]).astype(np.float32)
     n_vs_L = batter_platoon_rows["batter_n_vs_L"].fillna(0).values
     n_vs_R = batter_platoon_rows["batter_n_vs_R"].fillna(0).values
     features["v4_batter_platoon_log_n"] = np.log1p(
@@ -1312,9 +1322,8 @@ def compute_six_vectors(
     for oi, outcome in enumerate(OUTCOMES):
         vs_L = pitcher_platoon_rows[f"pitcher_{outcome}_vs_L"].fillna(league_rates[oi]).values
         vs_R = pitcher_platoon_rows[f"pitcher_{outcome}_vs_R"].fillna(league_rates[oi]).values
-        features[f"v5_pitcher_platoon_{outcome}"] = np.where(
-            stand == "L", vs_L, vs_R
-        ).astype(np.float32)
+        raw_rate = np.where(stand == "L", vs_L, vs_R)
+        features[f"v5_pitcher_platoon_{outcome}"] = (_safe_logit(raw_rate) - league_logodds[oi]).astype(np.float32)
     n_vs_L = pitcher_platoon_rows["pitcher_n_vs_L"].fillna(0).values
     n_vs_R = pitcher_platoon_rows["pitcher_n_vs_R"].fillna(0).values
     features["v5_pitcher_platoon_log_n"] = np.log1p(
@@ -1341,12 +1350,31 @@ def compute_six_vectors(
             else:
                 p_outcome = np.full(n_pa, league_rates[oi])
             interaction += p_pitch * p_outcome
-        features[f"v6_mix_{outcome}"] = interaction.astype(np.float32)
+        features[f"v6_mix_{outcome}"] = (_safe_logit(interaction) - league_logodds[oi]).astype(np.float32)
 
     # Sample size: min of pitcher total pitches and batter PAs
     pitcher_n_pitches = pitcher_mix_rows["pitcher_n_pitches"].fillna(0).values if "pitcher_n_pitches" in pitcher_mix_rows.columns else np.zeros(n_pa)
     batter_n_pa = batter_overall_rows["batter_n_pa"].fillna(0).values
     features["v6_mix_log_n"] = np.log1p(np.minimum(pitcher_n_pitches, batter_n_pa)).astype(np.float32)
+
+    # =====================================================
+    # EXTREMENESS FEATURES (indices 43-45)
+    # =====================================================
+    _vec_prefixes = ["v1_batter", "v2_pitcher", "v3_stadium",
+                     "v4_batter_platoon", "v5_pitcher_platoon", "v6_mix"]
+    all_deviations = []
+    for oi, outcome in enumerate(OUTCOMES):
+        for prefix in _vec_prefixes:
+            all_deviations.append(features[f"{prefix}_{outcome}"])
+    dev_stack = np.stack(all_deviations, axis=1)  # (n_pa, 36)
+    features["ext_max_abs_dev"] = np.abs(dev_stack).max(axis=1).astype(np.float32)
+    features["ext_mean_abs_dev"] = np.abs(dev_stack).mean(axis=1).astype(np.float32)
+    # Vector disagreement: mean over outcomes of std across 6 vectors
+    disagreements = []
+    for oi, outcome in enumerate(OUTCOMES):
+        pred_stack = np.stack([features[f"{prefix}_{outcome}"] for prefix in _vec_prefixes], axis=1)
+        disagreements.append(pred_stack.std(axis=1))
+    features["ext_vector_disagreement"] = np.mean(np.stack(disagreements, axis=1), axis=1).astype(np.float32)
 
     # ===========================================
     # DIAGNOSTIC: PA-level feature statistics
@@ -2048,6 +2076,12 @@ def _build_feature_list():
         for outcome in OUTCOMES:
             numeric_cols.append(f"v6_mix_{outcome}")
         numeric_cols.append("v6_mix_log_n")
+        # Extremeness features (indices 43-45 when six-vectors enabled)
+        numeric_cols.extend([
+            "ext_max_abs_dev",
+            "ext_mean_abs_dev",
+            "ext_vector_disagreement",
+        ])
 
     if ENABLE_BUCKET_FEATURES:
         for prefix in ["batter", "pitcher", "matchup"]:
@@ -2520,6 +2554,13 @@ def main() -> None:
             json.dump({
                 "outcomes": OUTCOMES,
                 "rates": six_vector_stats["league_rates"].tolist(),
+            }, f, indent=2)
+        # Save league log-odds
+        league_logodds_path = os.path.join(OUTPUT_DIR, "league_logodds.json")
+        with open(league_logodds_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "outcomes": OUTCOMES,
+                "logodds": six_vector_stats["league_logodds"].tolist(),
             }, f, indent=2)
 
     # Compute pitch-type statcast block (if enabled)

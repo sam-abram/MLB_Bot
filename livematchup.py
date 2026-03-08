@@ -424,6 +424,22 @@ def _load_six_vector_stats(pre_dir: str) -> dict:
     return stats
 
 
+def _safe_logit(p: float, eps: float = 1e-6) -> float:
+    """Clamp and compute log-odds: log(p / (1-p))."""
+    p_clamped = max(eps, min(p, 1.0 - eps))
+    return math.log(p_clamped / (1.0 - p_clamped))
+
+
+def _load_league_logodds(pre_dir: str) -> List[float]:
+    path = os.path.join(pre_dir, "league_logodds.json")
+    if os.path.exists(path):
+        d = json.load(open(path))
+        return list(d["logodds"])
+    # Fallback: compute from league_rates
+    lr = _load_base_rates(pre_dir)
+    return [_safe_logit(r) for r in lr]
+
+
 def _compute_six_vectors_single(
     batter_raw_id: int,
     pitcher_raw_id: int,
@@ -432,6 +448,7 @@ def _compute_six_vectors_single(
     p_throws: str,
     stats: dict,
     league_rates: List[float],
+    league_logodds: List[float],
 ) -> Dict[str, float]:
     """Compute the 42 six-vector features + pitcher_fatigue for one PA."""
     lr = league_rates
@@ -456,17 +473,20 @@ def _compute_six_vectors_single(
 
     # V1: Batter overall
     for i, oc in enumerate(OUTCOMES):
-        feats[f"v1_batter_{oc}"] = float(bo[f"batter_{oc}_rate"]) if bo is not None and f"batter_{oc}_rate" in bo.index else lr[i]
+        raw_rate = float(bo[f"batter_{oc}_rate"]) if bo is not None and f"batter_{oc}_rate" in bo.index else lr[i]
+        feats[f"v1_batter_{oc}"] = _safe_logit(raw_rate) - league_logodds[i]
     feats["v1_batter_log_n"] = math.log1p(float(bo["batter_n_pa"])) if bo is not None else 0.0
 
     # V2: Pitcher overall
     for i, oc in enumerate(OUTCOMES):
-        feats[f"v2_pitcher_{oc}"] = float(po[f"pitcher_{oc}_rate"]) if po is not None and f"pitcher_{oc}_rate" in po.index else lr[i]
+        raw_rate = float(po[f"pitcher_{oc}_rate"]) if po is not None and f"pitcher_{oc}_rate" in po.index else lr[i]
+        feats[f"v2_pitcher_{oc}"] = _safe_logit(raw_rate) - league_logodds[i]
     feats["v2_pitcher_log_n"] = math.log1p(float(po["pitcher_n_pa"])) if po is not None else 0.0
 
     # V3: Stadium
     for i, oc in enumerate(OUTCOMES):
-        feats[f"v3_stadium_{oc}"] = float(sr[f"stadium_{oc}_rate"]) if sr is not None and f"stadium_{oc}_rate" in sr.index else lr[i]
+        raw_rate = float(sr[f"stadium_{oc}_rate"]) if sr is not None and f"stadium_{oc}_rate" in sr.index else lr[i]
+        feats[f"v3_stadium_{oc}"] = _safe_logit(raw_rate) - league_logodds[i]
     feats["v3_stadium_log_n"] = math.log1p(float(sr["stadium_n_pa"])) if sr is not None else 0.0
 
     # V4: Batter platoon (vs pitcher hand)
@@ -476,7 +496,7 @@ def _compute_six_vectors_single(
             val = float(bp[col]) if col in bp.index and not pd.isna(bp[col]) else lr[i]
         else:
             val = lr[i]
-        feats[f"v4_batter_platoon_{oc}"] = val
+        feats[f"v4_batter_platoon_{oc}"] = _safe_logit(val) - league_logodds[i]
     if bp is not None:
         n_col = "batter_n_vs_L" if p_throws == "L" else "batter_n_vs_R"
         n_val = float(bp[n_col]) if n_col in bp.index and not pd.isna(bp[n_col]) else 0.0
@@ -491,7 +511,7 @@ def _compute_six_vectors_single(
             val = float(pp[col]) if col in pp.index and not pd.isna(pp[col]) else lr[i]
         else:
             val = lr[i]
-        feats[f"v5_pitcher_platoon_{oc}"] = val
+        feats[f"v5_pitcher_platoon_{oc}"] = _safe_logit(val) - league_logodds[i]
     if pp is not None:
         n_col = "pitcher_n_vs_L" if stand == "L" else "pitcher_n_vs_R"
         n_val = float(pp[n_col]) if n_col in pp.index and not pd.isna(pp[n_col]) else 0.0
@@ -508,7 +528,7 @@ def _compute_six_vectors_single(
             batter_col = f"batter_{oc}_vs_{pt}"
             p_outcome = float(bpt[batter_col]) if bpt is not None and batter_col in bpt.index and not pd.isna(bpt[batter_col]) else lr[i]
             interaction += p_pitch * p_outcome
-        feats[f"v6_mix_{oc}"] = interaction
+        feats[f"v6_mix_{oc}"] = _safe_logit(interaction) - league_logodds[i]
 
     if pm is not None and "pitcher_n_pitches" in pm.index and not pd.isna(pm["pitcher_n_pitches"]):
         pitcher_n = float(pm["pitcher_n_pitches"])
@@ -516,6 +536,20 @@ def _compute_six_vectors_single(
         pitcher_n = 0.0
     batter_n = float(bo["batter_n_pa"]) if bo is not None else 0.0
     feats["v6_mix_log_n"] = math.log1p(min(pitcher_n, batter_n))
+
+    # Extremeness features
+    _vec_prefixes = ["v1_batter", "v2_pitcher", "v3_stadium",
+                     "v4_batter_platoon", "v5_pitcher_platoon", "v6_mix"]
+    all_devs = [feats[f"{prefix}_{oc}"] for oc in OUTCOMES for prefix in _vec_prefixes]
+    feats["ext_max_abs_dev"] = max(abs(d) for d in all_devs)
+    feats["ext_mean_abs_dev"] = sum(abs(d) for d in all_devs) / len(all_devs)
+    disagreements = []
+    for oc in OUTCOMES:
+        preds = [feats[f"{prefix}_{oc}"] for prefix in _vec_prefixes]
+        mean_p = sum(preds) / len(preds)
+        var_p = sum((p - mean_p) ** 2 for p in preds) / len(preds)
+        disagreements.append(var_p ** 0.5)
+    feats["ext_vector_disagreement"] = sum(disagreements) / len(disagreements)
 
     return feats
 
@@ -589,30 +623,36 @@ def _load_model(pre_dir: str, art_dir: str):
     dropout = cfg.get("DROPOUT", 0.2)
     pt_cols = _detect_pt_statcast_cols(num_cols)
     num_pt = len(pt_cols)
+    # Load league logodds: prefer train_config.json, then file, then fallback
+    league_logodds = cfg.get("league_logodds") or _load_league_logodds(pre_dir)
 
     if model_class == "ContextualGateLogitHybridModel" and num_pt > 0:
         model = tm.ContextualGateLogitHybridModel(
             cat_cols=cat_cols, num_numeric=len(num_cols),
             vocab_sizes=vocab_sizes, num_classes=n_classes,
             hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
+            league_logodds=league_logodds,
         )
     elif model_class == "PerClassGateLogitHybridModel" and num_pt > 0:
         model = tm.PerClassGateLogitHybridModel(
             cat_cols=cat_cols, num_numeric=len(num_cols),
             vocab_sizes=vocab_sizes, num_classes=n_classes,
             hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
+            league_logodds=league_logodds,
         )
     elif model_class == "StatcastLogitHybridModel" and num_pt > 0:
         model = tm.StatcastLogitHybridModel(
             cat_cols=cat_cols, num_numeric=len(num_cols),
             vocab_sizes=vocab_sizes, num_classes=n_classes,
             hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
+            league_logodds=league_logodds,
         )
     else:
         model = tm.HybridModel(
             cat_cols=cat_cols, num_numeric=len(num_cols),
             vocab_sizes=vocab_sizes, num_classes=n_classes,
             hidden_dims=hidden_dims, dropout=dropout,
+            league_logodds=league_logodds,
         )
 
     state = torch.load(os.path.join(art_dir, "model.pt"), map_location="cpu", weights_only=True)
@@ -754,8 +794,9 @@ def run_matchup(
     feature_order = meta["features"]["feature_list_ordered"]
     label_set     = meta["labels"]["label_set_ordered"]
     vocabs        = json.load(open(os.path.join(pre_dir, "vocabs.json")))
-    base_rates    = _load_base_rates(pre_dir)
-    six_stats     = _load_six_vector_stats(pre_dir)
+    base_rates     = _load_base_rates(pre_dir)
+    league_logodds = _load_league_logodds(pre_dir)
+    six_stats      = _load_six_vector_stats(pre_dir)
 
     batter_vocab  = vocabs["batter_id"]   # str(raw_id) -> encoded_int
     pitcher_vocab = vocabs["pitcher_id"]
@@ -788,7 +829,7 @@ def run_matchup(
     # -- Build features --
     six_feats = _compute_six_vectors_single(
         batter_raw_id, pitcher_raw_id, stadium_raw,
-        stand_str, p_throws_str, six_stats, base_rates,
+        stand_str, p_throws_str, six_stats, base_rates, league_logodds,
     )
     pt_feats = _merge_pt_statcast(batter_raw_id, pitcher_raw_id, pre_dir, pt_cols)
 

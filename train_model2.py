@@ -983,6 +983,7 @@ class SimpleVectorWeightModel(nn.Module):
         num_vectors: int = 6,
         num_outcomes: int = 6,
         use_log_n_weighting: bool = False,
+        league_logodds: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.num_vectors = num_vectors
@@ -992,11 +993,17 @@ class SimpleVectorWeightModel(nn.Module):
         self.cat_cols: List[str] = []
         self.emb_dims: Dict[str, int] = {}
 
+        if league_logodds is not None:
+            self.register_buffer('league_logodds', torch.tensor(league_logodds, dtype=torch.float32))
+        else:
+            self.register_buffer('league_logodds', torch.zeros(num_outcomes, dtype=torch.float32))
+
         # Initialize to equal weights (zeros -> softmax -> 1/6 each)
         self.raw_weights = nn.Parameter(torch.zeros(num_vectors))
 
         if use_log_n_weighting:
             self.log_n_scale = nn.Parameter(torch.zeros(num_vectors))
+        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         n_params = num_vectors + (num_vectors if use_log_n_weighting else 0)
         print(f"[MODEL] SimpleVectorWeightModel:")
@@ -1025,6 +1032,8 @@ class SimpleVectorWeightModel(nn.Module):
 
         # Stack: (batch_size, 6_vectors, 6_outcomes)
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+        B, V, C = vectors.shape
+        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
         if self.use_log_n_weighting:
             log_n = torch.stack([
@@ -1037,11 +1046,9 @@ class SimpleVectorWeightModel(nn.Module):
             weights = torch.softmax(self.raw_weights, dim=0)  # (6,)
             weights = weights.unsqueeze(0).expand(batch_size, -1)  # (batch_size, 6)
 
-        # Weighted sum: (batch_size, 6_vectors, 6_outcomes) * (batch_size, 6_vectors, 1)
-        predicted_probs = (vectors * weights.unsqueeze(2)).sum(dim=1)
-
-        # Convert to logits for cross-entropy
-        logits = torch.log(predicted_probs + 1e-8)
+        # Weighted sum of log-odds deviations, then add league baseline
+        combined_deviation = (vectors * weights.unsqueeze(2)).sum(dim=1)  # (batch_size, 6)
+        logits = self.league_logodds.unsqueeze(0) + combined_deviation
         return logits
 
     def get_learned_weights(self) -> Dict[str, float]:
@@ -1074,10 +1081,16 @@ class HybridModel(nn.Module):
         num_classes: int,
         hidden_dims: List[int],
         dropout: float,
+        league_logodds: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.cat_cols = list(cat_cols)
         self.num_classes = int(num_classes)
+
+        if league_logodds is not None:
+            self.register_buffer('league_logodds', torch.tensor(league_logodds, dtype=torch.float32))
+        else:
+            self.register_buffer('league_logodds', torch.zeros(num_classes, dtype=torch.float32))
 
         # --- Embedding head ---
         self.embeddings = nn.ModuleDict()
@@ -1108,6 +1121,7 @@ class HybridModel(nn.Module):
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Combination weights: a (embedding), b (vector) ---
         self.raw_ab = nn.Parameter(torch.zeros(2))
@@ -1128,7 +1142,6 @@ class HybridModel(nn.Module):
             emb_parts.append(self.embeddings[col](ids))
         emb_concat = torch.cat(emb_parts, dim=1)
         emb_logits = self.emb_mlp(emb_concat)
-        emb_probs = torch.softmax(emb_logits, dim=1)  # (B, 6)
 
         # --- Vector head ---
         # Feature layout: [pitcher_fatigue, v1(6+1), v2(6+1), ..., v6(6+1)]
@@ -1140,6 +1153,8 @@ class HybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)  # (B, 6, 6)
+        B, V, C = vectors.shape
+        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
         log_n = torch.stack([
             x_num[:, 7], x_num[:, 14], x_num[:, 21],
@@ -1148,14 +1163,13 @@ class HybridModel(nn.Module):
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
         vec_weights = torch.softmax(adjusted, dim=1)  # (B, 6)
-        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
-        # --- Combine ---
+        # --- Combine in logit space ---
         ab = torch.softmax(self.raw_ab, dim=0)  # (2,)
-        combined_probs = ab[0] * emb_probs + ab[1] * vec_probs  # (B, 6)
-
-        logits = torch.log(combined_probs + 1e-8)
-        return logits
+        combined_logits = ab[0] * emb_logits + ab[1] * vec_logits
+        return combined_logits
 
     def get_learned_weights(self) -> Dict[str, float]:
         """Return the learned vector head weights (v1-v6)."""
@@ -1198,12 +1212,18 @@ class StatcastLogitHybridModel(nn.Module):
         hidden_dims: List[int],
         dropout: float,
         num_pt_statcast_cols: int = 90,
+        league_logodds: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.cat_cols = list(cat_cols)
         self.num_classes = int(num_classes)
         self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
         self.num_pt_statcast_cols = int(num_pt_statcast_cols)
+
+        if league_logodds is not None:
+            self.register_buffer('league_logodds', torch.tensor(league_logodds, dtype=torch.float32))
+        else:
+            self.register_buffer('league_logodds', torch.zeros(num_classes, dtype=torch.float32))
 
         # --- Embedding head ---
         self.embeddings = nn.ModuleDict()
@@ -1237,6 +1257,7 @@ class StatcastLogitHybridModel(nn.Module):
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Combination weights ---
         self.raw_ab = nn.Parameter(torch.zeros(2))
@@ -1270,6 +1291,8 @@ class StatcastLogitHybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+        B, V, C = vectors.shape
+        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
         log_n = torch.stack([
             x_num[:, 7], x_num[:, 14], x_num[:, 21],
@@ -1278,8 +1301,8 @@ class StatcastLogitHybridModel(nn.Module):
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
         vec_weights = torch.softmax(adjusted, dim=1)
-        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)
-        vec_logits = torch.log(vec_probs + 1e-8)
+        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Combine in logit space ---
         ab = torch.softmax(self.raw_ab, dim=0)
@@ -1327,12 +1350,18 @@ class ContextualGateLogitHybridModel(nn.Module):
         dropout: float,
         num_pt_statcast_cols: int = 90,
         gate_init_g: float = 0.38,
+        league_logodds: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.cat_cols = list(cat_cols)
         self.num_classes = int(num_classes)
         self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
         self.num_pt_statcast_cols = int(num_pt_statcast_cols)
+
+        if league_logodds is not None:
+            self.register_buffer('league_logodds', torch.tensor(league_logodds, dtype=torch.float32))
+        else:
+            self.register_buffer('league_logodds', torch.zeros(num_classes, dtype=torch.float32))
 
         # Determine per-pitch-type stride and column offsets
         num_pitch_types = 10
@@ -1377,6 +1406,7 @@ class ContextualGateLogitHybridModel(nn.Module):
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Contextual gate: 3 features -> scalar in [0,1] ---
         gate_input_dim = 3
@@ -1457,6 +1487,8 @@ class ContextualGateLogitHybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+        B, V, C = vectors.shape
+        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
         log_n = torch.stack([
             x_num[:, 7], x_num[:, 14], x_num[:, 21],
@@ -1465,8 +1497,8 @@ class ContextualGateLogitHybridModel(nn.Module):
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
         vec_weights = torch.softmax(adjusted, dim=1)
-        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)
-        vec_logits = torch.log(vec_probs + 1e-8)
+        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Contextual gate ---
         gate_feats = self._compute_gate_features(x_pt_raw)
@@ -1562,12 +1594,18 @@ class PerClassGateLogitHybridModel(nn.Module):
         dropout: float,
         num_pt_statcast_cols: int = 90,
         gate_init_g: float = 0.326,
+        league_logodds: Optional[List[float]] = None,
     ) -> None:
         super().__init__()
         self.cat_cols = list(cat_cols)
         self.num_classes = int(num_classes)
         self.vocab_sizes = {k: int(v) for k, v in vocab_sizes.items()}
         self.num_pt_statcast_cols = int(num_pt_statcast_cols)
+
+        if league_logodds is not None:
+            self.register_buffer('league_logodds', torch.tensor(league_logodds, dtype=torch.float32))
+        else:
+            self.register_buffer('league_logodds', torch.zeros(num_classes, dtype=torch.float32))
 
         # --- Embedding head (identical to StatcastLogitHybridModel) ---
         self.embeddings = nn.ModuleDict()
@@ -1599,6 +1637,7 @@ class PerClassGateLogitHybridModel(nn.Module):
         self.num_vectors = 6
         self.raw_vec_weights = nn.Parameter(torch.zeros(self.num_vectors))
         self.log_n_scale = nn.Parameter(torch.zeros(self.num_vectors))
+        self.vec_norm = nn.LayerNorm(self.num_classes)
 
         # --- Per-class gate network ---
         # Input: abs_delta(6) + ent_vec(1) + ent_emb(1) + delta_l2(1) = 9
@@ -1653,6 +1692,8 @@ class PerClassGateLogitHybridModel(nn.Module):
         v6 = x_num[:, 36:42]
 
         vectors = torch.stack([v1, v2, v3, v4, v5, v6], dim=1)
+        B, V, C = vectors.shape
+        vectors = self.vec_norm(vectors.reshape(B * V, C)).reshape(B, V, C)
 
         log_n = torch.stack([
             x_num[:, 7], x_num[:, 14], x_num[:, 21],
@@ -1661,8 +1702,8 @@ class PerClassGateLogitHybridModel(nn.Module):
 
         adjusted = self.raw_vec_weights.unsqueeze(0) + self.log_n_scale.unsqueeze(0) * log_n
         vec_weights = torch.softmax(adjusted, dim=1)
-        vec_probs = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)
-        vec_logits = torch.log(vec_probs + 1e-8)  # (B, 6)
+        combined_deviation = (vectors * vec_weights.unsqueeze(2)).sum(dim=1)  # (B, 6)
+        vec_logits = self.league_logodds.unsqueeze(0) + combined_deviation  # (B, 6)
 
         # --- Per-class contextual gate ---
         delta = emb_logits - vec_logits  # (B, 6)
@@ -2235,6 +2276,21 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=None, num_workers=NUM_WORKERS)
     test_loader = DataLoader(test_ds, batch_size=None, num_workers=NUM_WORKERS)
 
+    # Load league log-odds for vector head baseline
+    league_logodds_path = os.path.join(pre_dir, "league_logodds.json")
+    if os.path.exists(league_logodds_path):
+        with open(league_logodds_path) as f:
+            league_logodds = json.load(f)["logodds"]
+    else:
+        league_rates_path = os.path.join(pre_dir, "league_rates.json")
+        if os.path.exists(league_rates_path):
+            with open(league_rates_path) as f:
+                lr = json.load(f)["rates"]
+            eps = 1e-6
+            league_logodds = [float(math.log(max(r, eps) / max(1.0 - r, eps))) for r in lr]
+        else:
+            league_logodds = [0.0] * num_classes
+
     # Build model
     # Detect pitch-type statcast columns
     pt_statcast_cols = [c for c in num_cols if c.startswith("pitcher_pitch_rate_") or
@@ -2261,6 +2317,7 @@ def main() -> None:
             dropout=DROPOUT,
             num_pt_statcast_cols=num_pt_statcast,
             gate_init_g=0.326,
+            league_logodds=league_logodds,
         ).to(DEVICE)
     elif use_contextual_gate and num_pt_statcast > 0 and len(cat_cols) > 0:
         print(f"[CONFIG] Using ContextualGateLogitHybridModel ({num_pt_statcast} statcast cols + contextual gate)")
@@ -2273,6 +2330,7 @@ def main() -> None:
             dropout=DROPOUT,
             num_pt_statcast_cols=num_pt_statcast,
             gate_init_g=0.38,
+            league_logodds=league_logodds,
         ).to(DEVICE)
     elif use_pt_statcast and num_pt_statcast > 0 and len(cat_cols) > 0:
         print(f"[CONFIG] Using StatcastLogitHybridModel ({num_pt_statcast} statcast cols in embedding head)")
@@ -2284,6 +2342,7 @@ def main() -> None:
             hidden_dims=HIDDEN_DIMS,
             dropout=DROPOUT,
             num_pt_statcast_cols=num_pt_statcast,
+            league_logodds=league_logodds,
         ).to(DEVICE)
     elif USE_HYBRID_MODEL and len(cat_cols) > 0:
         print("[CONFIG] Using hybrid model (embeddings + vectors with learnable a,b)")
@@ -2294,6 +2353,7 @@ def main() -> None:
             num_classes=num_classes,
             hidden_dims=HIDDEN_DIMS,
             dropout=DROPOUT,
+            league_logodds=league_logodds,
         ).to(DEVICE)
     elif USE_SIMPLE_VECTOR_WEIGHTS and len(cat_cols) == 0:
         print("[CONFIG] Using simple weighted vector combination model")
@@ -2301,6 +2361,7 @@ def main() -> None:
             num_vectors=6,
             num_outcomes=num_classes,
             use_log_n_weighting=True,
+            league_logodds=league_logodds,
         ).to(DEVICE)
     elif USE_EMBEDDING_INTERACTIONS and len(cat_cols) > 0:
         print("[CONFIG] Using embedding interactions (batter x pitcher)")
@@ -2493,6 +2554,7 @@ def main() -> None:
             "model_class": type(model).__name__,
             "interaction_dim": BATTER_EMBED_DIM if USE_EMBEDDING_INTERACTIONS else 0,
         },
+        "league_logodds": league_logodds,
         "timestamp": _now_str(),
     }
     _write_json(os.path.join(artifact_dir, "train_config.json"), train_config)

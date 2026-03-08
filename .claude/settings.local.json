@@ -16,7 +16,10 @@
       "Bash(del /Q preprocessed*.parquet preprocessed*.json)",
       "Bash(.csv)",
       "Bash(.parquet \")",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(tail:*)",
+      "Bash(cd:*)",
+      "Bash(grep:*)"
     ]
   }
 }

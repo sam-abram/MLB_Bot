@@ -1,0 +1,27 @@
+{
+  "batters": {
+    "juan soto": {
+      "id": 665742,
+      "name": "Juan Soto"
+    },
+    "aaron judge": {
+      "id": 592450,
+      "name": "Aaron Judge"
+    }
+  },
+  "pitchers": {
+    "gerrit cole": {
+      "id": 543037,
+      "name": "Gerrit Cole"
+    },
+    "tarik skubal": {
+      "id": 669373,
+      "name": "Tarik Skubal"
+    },
+    "adrian houser": {
+      "id": 605288,
+      "name": "Adrian Houser"
+    }
+  },
+  "built": true
+}
