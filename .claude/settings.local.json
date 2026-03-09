@@ -23,7 +23,8 @@
       "Bash(ls tasks:*)",
       "Bash(done)",
       "Bash(echo === $task_file done ===:*)",
-      "Bash(source:*)"
+      "Bash(source:*)",
+      "Bash(ls:*)"
     ]
   }
 }
