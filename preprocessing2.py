@@ -43,8 +43,8 @@ INPUT_CSV = "statcast_pitches.csv"  # override via CLI
 OUTPUT_FORMAT = "parquet"  # or "csv"
 
 # Split strategy: train <= TRAIN_END_DATE, val <= VAL_END_DATE, else test
-TRAIN_END_DATE = "2025-06-30"
-VAL_END_DATE = "2025-09-27"
+TRAIN_END_DATE = "2025-09-10"
+VAL_END_DATE = "2025-09-17"
 
 # Tendency smoothing / shrink parameters
 # =========================

@@ -2610,13 +2610,16 @@ def main() -> None:
         vo = val_pc_stats["_overall"]
         print(f"  {'OVERALL':<8s} | {vo['g_mean']:>10.4f} {vo['g_std']:>10.4f}")
 
-        print(f"\n  {'Class':<8s} | {'Test g mean':>10s} {'Test g std':>10s} {'Test g p10':>10s} {'Test g p50':>10s} {'Test g p90':>10s} | {'abs_d mean':>10s}")
-        print(f"  {'-'*74}")
-        for name in label_set_ordered:
-            ts = test_pc_stats[name]
-            print(f"  {name:<8s} | {ts['g_mean']:>10.4f} {ts['g_std']:>10.4f} {ts['g_p10']:>10.4f} {ts['g_p50']:>10.4f} {ts['g_p90']:>10.4f} | {ts['abs_delta_mean']:>10.4f}")
-        to = test_pc_stats["_overall"]
-        print(f"  {'OVERALL':<8s} | {to['g_mean']:>10.4f} {to['g_std']:>10.4f}")
+        if test_pc_stats.get(label_set_ordered[0]) is not None:
+            print(f"\n  {'Class':<8s} | {'Test g mean':>10s} {'Test g std':>10s} {'Test g p10':>10s} {'Test g p50':>10s} {'Test g p90':>10s} | {'abs_d mean':>10s}")
+            print(f"  {'-'*74}")
+            for name in label_set_ordered:
+                ts = test_pc_stats[name]
+                print(f"  {name:<8s} | {ts['g_mean']:>10.4f} {ts['g_std']:>10.4f} {ts['g_p10']:>10.4f} {ts['g_p50']:>10.4f} {ts['g_p90']:>10.4f} | {ts['abs_delta_mean']:>10.4f}")
+            to = test_pc_stats["_overall"]
+            print(f"  {'OVERALL':<8s} | {to['g_mean']:>10.4f} {to['g_std']:>10.4f}")
+        else:
+            print("  Test per-class gate stats: N/A (no test split)")
 
         metrics["per_class_gate_stats_val"] = val_pc_stats
         metrics["per_class_gate_stats_test"] = test_pc_stats

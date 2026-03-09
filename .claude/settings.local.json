@@ -19,7 +19,11 @@
       "Bash(dir:*)",
       "Bash(tail:*)",
       "Bash(cd:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(ls tasks:*)",
+      "Bash(done)",
+      "Bash(echo === $task_file done ===:*)",
+      "Bash(source:*)"
     ]
   }
 }
