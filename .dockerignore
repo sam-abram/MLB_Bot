@@ -1,0 +1,19 @@
+# Never include source data or offline pipeline tools
+statcast_pitches.csv
+data_pipeline2.py
+preprocessing2.py
+livematchup.py
+
+# Skip the large train/val/test split parquets — only the lookup tables are needed for inference
+preprocessed/train.parquet
+preprocessed/val.parquet
+preprocessed/test.parquet
+
+# Dev artifacts
+__pycache__
+*.pyc
+*.pyo
+frontend/node_modules
+frontend/build
+.git
+.claude

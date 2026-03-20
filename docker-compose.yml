@@ -1,0 +1,7 @@
+version: "3.8"
+services:
+  mlb-predictor:
+    build: .
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
