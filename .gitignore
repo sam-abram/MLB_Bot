@@ -1,19 +1,5 @@
-# Large data files
-*.csv
-!small_*.csv
-
-# Python
+frontend/node_modules/
+frontend/build/
 __pycache__/
 *.pyc
-.venv/
-
-# Model binaries (too large for GitHub)
-model_artifacts/model.pt
-
-# Windows artifacts
-nul
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
+*.pyo
