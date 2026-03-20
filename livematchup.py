@@ -618,7 +618,7 @@ def _load_model(pre_dir: str, art_dir: str):
     num_cols  = [c for c in feature_order if c not in set(cat_cols)]
     vocab_sizes = meta["features"].get("categorical_vocab_sizes", {})
     n_classes = len(meta["labels"]["label_to_id"])
-    model_class = cfg.get("resolved", {}).get("model_class", "HybridModel")
+    model_class = cfg.get("resolved", {}).get("model_class", "PerClassGateLogitHybridModel")
     hidden_dims = cfg.get("HIDDEN_DIMS", [256, 128])
     dropout = cfg.get("DROPOUT", 0.2)
     pt_cols = _detect_pt_statcast_cols(num_cols)
@@ -626,34 +626,14 @@ def _load_model(pre_dir: str, art_dir: str):
     # Load league logodds: prefer train_config.json, then file, then fallback
     league_logodds = cfg.get("league_logodds") or _load_league_logodds(pre_dir)
 
-    if model_class == "ContextualGateLogitHybridModel" and num_pt > 0:
-        model = tm.ContextualGateLogitHybridModel(
-            cat_cols=cat_cols, num_numeric=len(num_cols),
-            vocab_sizes=vocab_sizes, num_classes=n_classes,
-            hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
-            league_logodds=league_logodds,
-        )
-    elif model_class == "PerClassGateLogitHybridModel" and num_pt > 0:
-        model = tm.PerClassGateLogitHybridModel(
-            cat_cols=cat_cols, num_numeric=len(num_cols),
-            vocab_sizes=vocab_sizes, num_classes=n_classes,
-            hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
-            league_logodds=league_logodds,
-        )
-    elif model_class == "StatcastLogitHybridModel" and num_pt > 0:
-        model = tm.StatcastLogitHybridModel(
-            cat_cols=cat_cols, num_numeric=len(num_cols),
-            vocab_sizes=vocab_sizes, num_classes=n_classes,
-            hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
-            league_logodds=league_logodds,
-        )
-    else:
-        model = tm.HybridModel(
-            cat_cols=cat_cols, num_numeric=len(num_cols),
-            vocab_sizes=vocab_sizes, num_classes=n_classes,
-            hidden_dims=hidden_dims, dropout=dropout,
-            league_logodds=league_logodds,
-        )
+    if model_class != "PerClassGateLogitHybridModel":
+        print(f"[WARN] train_config says model_class={model_class!r}, but loading as PerClassGateLogitHybridModel.")
+    model = tm.PerClassGateLogitHybridModel(
+        cat_cols=cat_cols, num_numeric=len(num_cols),
+        vocab_sizes=vocab_sizes, num_classes=n_classes,
+        hidden_dims=hidden_dims, dropout=dropout, num_pt_statcast_cols=num_pt,
+        league_logodds=league_logodds,
+    )
 
     state = torch.load(os.path.join(art_dir, "model.pt"), map_location="cpu", weights_only=True)
     model.load_state_dict(state)

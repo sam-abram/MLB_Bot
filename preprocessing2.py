@@ -43,8 +43,8 @@ INPUT_CSV = "statcast_pitches.csv"  # override via CLI
 OUTPUT_FORMAT = "parquet"  # or "csv"
 
 # Split strategy: train <= TRAIN_END_DATE, val <= VAL_END_DATE, else test
-TRAIN_END_DATE = "2025-09-10"
-VAL_END_DATE = "2025-09-17"
+TRAIN_END_DATE = "2025-08-31"
+VAL_END_DATE = "2025-09-14"
 
 # Tendency smoothing / shrink parameters
 # =========================
@@ -109,9 +109,6 @@ SHRINKAGE_K = 150               # PA-equivalents of prior weight for Bayesian sh
 # Feature toggles for ablation experiments
 ENABLE_SIX_VECTORS = True       # Six-vector interpretable features (42)
 ENABLE_EMBEDDINGS = True        # Enabled for hybrid model experiment
-ENABLE_BUCKET_FEATURES = False  # Set to False to disable bucket-weighted tendency features
-ENABLE_PARK_FACTORS = False     # Set to False to disable park factor features
-ENABLE_PITCHTYPE_STATCAST_BLOCK = False  # Pitch-type statcast block (90 cols, CLI toggle)
 ENABLE_PITCHTYPE_STATCAST_V2 = False    # Pitch-type statcast v2 block (extended cols, CLI toggle)
 
 # PA-level feature columns
@@ -305,61 +302,6 @@ def _inplay_indicator_from_description(desc: pd.Series) -> pd.Series:
     return inplay.astype("int64")
 
 
-# =========================
-# Pitch characteristic helpers: zone tier, velocity tier, pitch-bin key
-# =========================
-
-def _zone_tier_from_zone(zone_int: pd.Series) -> pd.Series:
-    """
-    Map Statcast zone (1-14) to tier.
-
-    Statcast zones:
-    - 1-9: Strike zone grid (1=upper-left to 9=lower-right, 5=center)
-    - 11-14: Chase zones (just outside)
-    - 10+: Waste (way outside)
-
-    Mapping:
-    - HEART: Zone 5 (dead center)
-    - SHADOW: Zones 1,2,3,4,6,7,8,9 (rest of strike zone)
-    - CHASE: Zones 11,12,13,14 (just outside)
-    - WASTE: Zone 10 or missing (way outside / unknown)
-    """
-    z = pd.to_numeric(zone_int, errors="coerce").fillna(0).astype("int64")
-    out = pd.Series(["WASTE"] * len(z), index=z.index, dtype="string")
-
-    out.loc[z == 5] = "HEART"
-    out.loc[z.isin([1, 2, 3, 4, 6, 7, 8, 9])] = "SHADOW"
-    out.loc[z.isin([11, 12, 13, 14])] = "CHASE"
-    # Everything else stays WASTE
-
-    return out
-
-
-def _sanitize_pitch_bin_key(k: str) -> str:
-    # Keep deterministic but filesystem/column-name safe-ish
-    return (k or "").replace("|", "_").replace(" ", "")
-
-
-def _assign_pitch_bucket(
-    pitch_type: pd.Series,
-    zone: pd.Series,
-) -> pd.Series:
-    """
-    Assign each pitch to one of 40 buckets (pitch_type x zone).
-
-    No velocity tiers.
-    """
-    # Remap pitch types
-    pt = pitch_type.astype("string").str.upper().fillna("OTHER")
-    pt_mapped = pt.map(PITCH_TYPE_REMAP).fillna("OTHER")
-
-    # Get zone tier
-    zone_tier = _zone_tier_from_zone(zone)
-
-    # Combine
-    bucket = pt_mapped + "|" + zone_tier
-
-    return bucket
 
 
 # =========================
@@ -530,307 +472,6 @@ def pass0_fit_vocabs_and_tendencies(input_csv: str, split_info: SplitInfo) -> Tu
     )
 
     return vocabs, tendency_spec
-
-
-# =========================
-# PASS 2: Fit PA-ending tendencies (NEW SYSTEM)
-# =========================
-
-def _hierarchical_smooth(
-    bucket_counts: np.ndarray,
-    bucket_n: int,
-    overall_counts: np.ndarray,
-    overall_n: int,
-    league_rates: np.ndarray,
-    alpha: float,
-) -> np.ndarray:
-    """
-    Smooth bucket rates: bucket -> player overall -> league.
-
-    NO platoon in hierarchy (platoon is handled separately).
-    """
-    # League prior
-    league_prior = league_rates / (league_rates.sum() + 1e-12)
-
-    # Player overall (smoothed toward league)
-    if overall_n > 0:
-        overall_rate = (overall_counts + alpha * league_prior) / (overall_n + alpha)
-    else:
-        overall_rate = league_prior.copy()
-    overall_rate = overall_rate / (overall_rate.sum() + 1e-12)
-
-    # Bucket (smoothed toward player overall)
-    if bucket_n > 0:
-        bucket_rate = (bucket_counts + alpha * overall_rate) / (bucket_n + alpha)
-    else:
-        bucket_rate = overall_rate.copy()
-    bucket_rate = bucket_rate / (bucket_rate.sum() + 1e-12)
-
-    return bucket_rate
-
-
-def pass2_fit_pa_ending_tendencies(
-    input_csv: str,
-    split_info: SplitInfo,
-    alpha: float = TENDENCY_ALPHA,
-) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
-    """
-    Compute PA-outcome rates by pitch bucket from TRAIN split only.
-
-    40 buckets (pitch_type x zone). No platoon dimension.
-    Hierarchical smoothing: bucket -> player overall -> league.
-
-    Returns:
-        batter_df: batter_id -> outcome rates by bucket + overall stats
-        pitcher_df: pitcher_id -> outcome rates by bucket + usage rates
-        league_fallback: league-level rates and metadata for inference
-    """
-    print("[PASS 2] Fitting PA-ending tendencies from TRAIN split only...")
-
-    train_end = pd.to_datetime(split_info.train_end_date)
-    val_end = pd.to_datetime(split_info.val_end_date)
-
-    n_outcomes = len(OUTCOMES)
-    outcome_to_idx = {o: i for i, o in enumerate(OUTCOMES)}
-
-    # 40 buckets (pitch_type x zone)
-    all_buckets = list(ALL_BUCKETS)
-    n_buckets = len(all_buckets)
-
-    # --- Accumulators ---
-    batter_counts = defaultdict(lambda: {
-        "by_bucket": defaultdict(lambda: np.zeros(n_outcomes, dtype=np.float64)),
-        "n_by_bucket": defaultdict(int),
-        "overall": np.zeros(n_outcomes, dtype=np.float64),
-        "n_overall": 0,
-    })
-    pitcher_counts = defaultdict(lambda: {
-        "by_bucket": defaultdict(lambda: np.zeros(n_outcomes, dtype=np.float64)),
-        "n_by_bucket": defaultdict(int),
-        "overall": np.zeros(n_outcomes, dtype=np.float64),
-        "n_overall": 0,
-        "usage_by_bucket": defaultdict(int),
-        "usage_total": 0,
-    })
-    league_counts = {
-        "by_bucket": defaultdict(lambda: np.zeros(n_outcomes, dtype=np.float64)),
-        "n_by_bucket": defaultdict(int),
-        "overall": np.zeros(n_outcomes, dtype=np.float64),
-        "n_overall": 0,
-        "usage_by_bucket": defaultdict(int),
-        "usage_total": 0,
-    }
-
-    rows_read = 0
-    train_pitch_rows = 0
-    pa_ending_rows = 0
-
-    for i, chunk in enumerate(pd.read_csv(input_csv, chunksize=READ_CHUNK_ROWS, low_memory=True)):
-        rows_read += len(chunk)
-        missing = [c for c in REQUIRED_PITCH_COLUMNS if c not in chunk.columns]
-        _require(not missing, f"Missing required columns in input: {missing}")
-
-        chunk["game_date"] = pd.to_datetime(chunk["game_date"], errors="coerce").dt.normalize()
-        y_str = _map_to_six_labels(chunk["pa_outcome"])
-        good = chunk["game_date"].notna() & y_str.notna()
-        df = chunk.loc[good].copy()
-        if df.empty:
-            continue
-
-        split = _assign_split(df["game_date"], train_end, val_end)
-        df = df.loc[split == "train"].copy()
-        if df.empty:
-            continue
-
-        train_pitch_rows += len(df)
-
-        # IDs
-        batter_id = _coerce_int_series(df.get("batter_id", pd.Series([0] * len(df), index=df.index))).astype("int64")
-        pitcher_id = _coerce_int_series(df.get("pitcher_id", pd.Series([0] * len(df), index=df.index))).astype("int64")
-
-        ok_ids = (batter_id > 0) & (pitcher_id > 0)
-        if not bool(ok_ids.any()):
-            continue
-        df = df.loc[ok_ids].copy()
-        batter_id = batter_id.loc[ok_ids]
-        pitcher_id = pitcher_id.loc[ok_ids]
-
-        n = len(df)
-
-        # Compute bucket (pitch_type x zone, no velocity)
-        bucket = _assign_pitch_bucket(df["pitch_type"], df["zone"])
-
-        # Map outcomes
-        pa_outcome = df["pa_outcome"].astype("string")
-        six_outcome = _map_to_six_labels(pa_outcome)
-
-        # Detect PA-ending pitches
-        if "is_last_pitch_of_pa" in df.columns:
-            is_last = pd.to_numeric(df["is_last_pitch_of_pa"], errors="coerce").fillna(0).astype("int64")
-        elif "pitch_number_in_pa" in df.columns and "pa_id" in df.columns:
-            max_pitch = df.groupby("pa_id")["pitch_number_in_pa"].transform("max")
-            is_last = (df["pitch_number_in_pa"] == max_pitch).astype("int64")
-        else:
-            is_last = pd.Series([0] * n, index=df.index, dtype="int64")
-
-        # 1) Accumulate pitcher usage (ALL pitches, 40 buckets)
-        usage_df = pd.DataFrame({"pid": pitcher_id.values, "bucket": bucket.values})
-        for (pid_val, b_val), cnt in usage_df.groupby(["pid", "bucket"]).size().items():
-            pitcher_counts[int(pid_val)]["usage_by_bucket"][b_val] += int(cnt)
-            pitcher_counts[int(pid_val)]["usage_total"] += int(cnt)
-        for b_val, cnt in usage_df["bucket"].value_counts().items():
-            league_counts["usage_by_bucket"][b_val] += int(cnt)
-            league_counts["usage_total"] += int(cnt)
-
-        # 2) Accumulate PA-ending outcomes
-        pa_ending_mask = is_last == 1
-        outcome_idx = six_outcome.map(outcome_to_idx)
-        valid_pa = pa_ending_mask & outcome_idx.notna()
-        if valid_pa.any():
-            df_pa = pd.DataFrame({
-                "bid": batter_id.loc[valid_pa].values,
-                "pid": pitcher_id.loc[valid_pa].values,
-                "oi": outcome_idx.loc[valid_pa].astype("int64").values,
-                "bucket": bucket.loc[valid_pa].values,
-            })
-            pa_ending_rows += len(df_pa)
-
-            # --- League ---
-            for oi_val, cnt in df_pa["oi"].value_counts().items():
-                league_counts["overall"][int(oi_val)] += float(cnt)
-                league_counts["n_overall"] += int(cnt)
-            for (b_val, oi_val), cnt in df_pa.groupby(["bucket", "oi"]).size().items():
-                league_counts["by_bucket"][b_val][int(oi_val)] += float(cnt)
-                league_counts["n_by_bucket"][b_val] += int(cnt)
-
-            # --- Batter ---
-            for (bid_val, oi_val), cnt in df_pa.groupby(["bid", "oi"]).size().items():
-                batter_counts[int(bid_val)]["overall"][int(oi_val)] += float(cnt)
-                batter_counts[int(bid_val)]["n_overall"] += int(cnt)
-            for (bid_val, b_val, oi_val), cnt in df_pa.groupby(["bid", "bucket", "oi"]).size().items():
-                batter_counts[int(bid_val)]["by_bucket"][b_val][int(oi_val)] += float(cnt)
-                batter_counts[int(bid_val)]["n_by_bucket"][b_val] += int(cnt)
-
-            # --- Pitcher ---
-            for (pid_val, oi_val), cnt in df_pa.groupby(["pid", "oi"]).size().items():
-                pitcher_counts[int(pid_val)]["overall"][int(oi_val)] += float(cnt)
-                pitcher_counts[int(pid_val)]["n_overall"] += int(cnt)
-            for (pid_val, b_val, oi_val), cnt in df_pa.groupby(["pid", "bucket", "oi"]).size().items():
-                pitcher_counts[int(pid_val)]["by_bucket"][b_val][int(oi_val)] += float(cnt)
-                pitcher_counts[int(pid_val)]["n_by_bucket"][b_val] += int(cnt)
-
-        if (i + 1) % 10 == 0:
-            print(f"  - [PASS 2] processed {rows_read:,} pitch rows... (train: {train_pitch_rows:,}, PA-ending: {pa_ending_rows:,})")
-
-    _require(train_pitch_rows > 0, "No TRAIN pitch rows found (after filtering).")
-    _require(pa_ending_rows > 0, "No PA-ending pitch rows found in TRAIN split.")
-
-    # Compute league rates
-    league_overall_n = float(league_counts["overall"].sum())
-    league_rates = league_counts["overall"] / max(league_overall_n, 1.0)
-    league_rates = league_rates / league_rates.sum()
-
-    # League usage rates per bucket (40 buckets)
-    league_usage_total = float(league_counts["usage_total"])
-    league_usage_rates = {}
-    for b in all_buckets:
-        league_usage_rates[b] = float(league_counts["usage_by_bucket"].get(b, 0)) / max(league_usage_total, 1.0)
-
-    print(f"[PASS 2] League outcome rates: {dict(zip(OUTCOMES, league_rates.tolist()))}")
-    print(f"[PASS 2] Total PA-ending pitches in train: {pa_ending_rows:,}")
-
-    # Build batter DataFrame
-    print(f"[PASS 2] Building batter tendency table for {len(batter_counts):,} batters...")
-    batter_rows = []
-    for bid, data in batter_counts.items():
-        row = {"batter_id": int(bid)}
-        overall_n = data["n_overall"]
-        row["batter_n_pa"] = overall_n
-
-        # Overall rates (smoothed toward league)
-        overall_rate = _hierarchical_smooth(
-            data["overall"], overall_n,
-            data["overall"], overall_n,
-            league_rates, alpha
-        )
-        for oi, outcome in enumerate(OUTCOMES):
-            row[f"batter_{outcome}_rate"] = float(overall_rate[oi])
-
-        # Per-bucket rates (40 buckets)
-        for bucket in all_buckets:
-            bucket_safe = _sanitize_pitch_bin_key(bucket)
-            b_counts = data["by_bucket"].get(bucket, np.zeros(n_outcomes, dtype=np.float64))
-            b_n = int(b_counts.sum())
-
-            rates = _hierarchical_smooth(
-                b_counts, b_n,
-                data["overall"], overall_n,
-                league_rates, alpha
-            )
-            for oi, outcome in enumerate(OUTCOMES):
-                row[f"batter_{outcome}_{bucket_safe}"] = float(rates[oi])
-            row[f"batter_n_{bucket_safe}"] = b_n
-
-        batter_rows.append(row)
-
-    batter_df = pd.DataFrame(batter_rows)
-
-    # Build pitcher DataFrame
-    print(f"[PASS 2] Building pitcher tendency table for {len(pitcher_counts):,} pitchers...")
-    pitcher_rows = []
-    for pid, data in pitcher_counts.items():
-        row = {"pitcher_id": int(pid)}
-        overall_n = data["n_overall"]
-        row["pitcher_n_pa"] = overall_n
-
-        # Overall rates
-        overall_rate = _hierarchical_smooth(
-            data["overall"], overall_n,
-            data["overall"], overall_n,
-            league_rates, alpha
-        )
-        for oi, outcome in enumerate(OUTCOMES):
-            row[f"pitcher_{outcome}_rate"] = float(overall_rate[oi])
-
-        # Per-bucket rates + usage (40 buckets)
-        usage_total = float(data["usage_total"])
-        for bucket in all_buckets:
-            bucket_safe = _sanitize_pitch_bin_key(bucket)
-            b_counts = data["by_bucket"].get(bucket, np.zeros(n_outcomes, dtype=np.float64))
-            b_n = int(b_counts.sum())
-
-            rates = _hierarchical_smooth(
-                b_counts, b_n,
-                data["overall"], overall_n,
-                league_rates, alpha
-            )
-            for oi, outcome in enumerate(OUTCOMES):
-                row[f"pitcher_{outcome}_{bucket_safe}"] = float(rates[oi])
-
-            usage_rate = float(data["usage_by_bucket"].get(bucket, 0)) / max(usage_total, 1.0)
-            row[f"pitcher_usage_{bucket_safe}"] = float(usage_rate)
-            row[f"pitcher_n_{bucket_safe}"] = b_n
-
-        pitcher_rows.append(row)
-
-    pitcher_df = pd.DataFrame(pitcher_rows)
-
-    # Build league fallback
-    league_fallback = {
-        "outcomes": OUTCOMES,
-        "buckets": all_buckets,
-        "pitch_types": PITCH_TYPES,
-        "zone_tiers": ZONE_TIERS,
-        "pitch_type_remap": PITCH_TYPE_REMAP,
-        "league_rates": league_rates.tolist(),
-        "league_usage": {bucket: float(league_usage_rates.get(bucket, 0)) for bucket in all_buckets},
-        "smoothing_alpha": alpha,
-        "n_pa_ending_train": pa_ending_rows,
-    }
-
-    print("[PASS 2] PA-ending tendency fitting complete.")
-    return batter_df, pitcher_df, league_fallback
-
 
 # =========================
 # PASS 2b: Six-vector statistics (NEW SYSTEM)
@@ -1413,313 +1054,9 @@ def compute_six_vectors(
 # =========================
 # PASS 3: Build PA-level rows, join tendencies, encode categoricals, write splits
 # =========================
-
-def _compute_park_factors(
-    input_csv: str,
-    split_info: SplitInfo,
-    alpha: float = 5.0,
-) -> pd.DataFrame:
-    """
-    Compute park factors from TRAIN split only.
-
-    For each stadium, compute the rate of each outcome relative to league average.
-    Apply Dirichlet smoothing toward league rates.
-
-    Returns DataFrame with columns:
-        stadium_id, park_K_factor, park_BIPO_factor, park_BB_factor,
-        park_1B_factor, park_XBH_factor, park_HR_factor, park_n_pa
-    """
-    train_end = pd.to_datetime(split_info.train_end_date)
-
-    # Accumulators
-    stadium_counts = defaultdict(lambda: np.zeros(len(OUTCOMES), dtype=np.float64))
-    stadium_n = defaultdict(int)
-    league_counts_pf = np.zeros(len(OUTCOMES), dtype=np.float64)
-    league_n = 0
-
-    outcome_to_idx = {o: i for i, o in enumerate(OUTCOMES)}
-
-    for chunk in pd.read_csv(input_csv, chunksize=READ_CHUNK_ROWS, low_memory=True):
-        chunk["game_date"] = pd.to_datetime(chunk["game_date"], errors="coerce").dt.normalize()
-        y_str = _map_to_six_labels(chunk["pa_outcome"])
-        good = chunk["game_date"].notna() & y_str.notna()
-        chunk = chunk.loc[good].copy()
-        if chunk.empty:
-            continue
-
-        split = _assign_split(chunk["game_date"], train_end, pd.to_datetime(split_info.val_end_date))
-        chunk = chunk.loc[split == "train"].copy()
-        if chunk.empty:
-            continue
-
-        # Detect PA-ending pitches
-        if "is_last_pitch_of_pa" in chunk.columns:
-            is_last = pd.to_numeric(chunk["is_last_pitch_of_pa"], errors="coerce").fillna(0).astype("int64")
-        elif "pitch_number_in_pa" in chunk.columns and "pa_id" in chunk.columns:
-            max_pitch = chunk.groupby("pa_id")["pitch_number_in_pa"].transform("max")
-            is_last = (chunk["pitch_number_in_pa"] == max_pitch).astype("int64")
-        else:
-            is_last = pd.Series([0] * len(chunk), index=chunk.index, dtype="int64")
-
-        pa_end = chunk[is_last == 1].copy()
-        if pa_end.empty:
-            continue
-
-        pa_end["outcome"] = _map_to_six_labels(pa_end["pa_outcome"])
-        pa_end = pa_end[pa_end["outcome"].notna()]
-        if pa_end.empty:
-            continue
-
-        # Ensure stadium_id exists
-        if "stadium_id" not in pa_end.columns:
-            for c in ["park", "park_id", "stadium", "venue_name", "park_proxy_home_team"]:
-                if c in pa_end.columns:
-                    pa_end["stadium_id"] = pa_end[c]
-                    break
-        if "stadium_id" not in pa_end.columns:
-            pa_end["stadium_id"] = "__UNK__"
-        pa_end["stadium_id"] = pa_end["stadium_id"].astype("string").fillna("__UNK__").replace("", "__UNK__")
-
-        # Vectorized accumulation
-        pa_end["oi"] = pa_end["outcome"].map(outcome_to_idx)
-        pa_end = pa_end[pa_end["oi"].notna()]
-        pa_end["oi"] = pa_end["oi"].astype("int64")
-
-        for (stadium, oi_val), cnt in pa_end.groupby(["stadium_id", "oi"]).size().items():
-            stadium_counts[str(stadium)][int(oi_val)] += float(cnt)
-            stadium_n[str(stadium)] += int(cnt)
-            league_counts_pf[int(oi_val)] += float(cnt)
-            league_n += int(cnt)
-
-    # Compute league rates
-    league_rates_pf = league_counts_pf / max(league_n, 1)
-
-    # Build park factors DataFrame
-    rows = []
-    for stadium, counts in stadium_counts.items():
-        n = stadium_n[stadium]
-
-        # Smoothed rates: (counts + alpha * league_rates) / (n + alpha)
-        smoothed = (counts + alpha * league_rates_pf) / (n + alpha)
-
-        # Park factor = smoothed_rate / league_rate
-        factors = smoothed / (league_rates_pf + 1e-8)
-
-        row = {"stadium_id": stadium, "park_n_pa": n}
-        for i, outcome in enumerate(OUTCOMES):
-            row[f"park_{outcome}_factor"] = factors[i]
-
-        rows.append(row)
-
-    park_df = pd.DataFrame(rows)
-
-    # Log summary
-    print(f"[PARK FACTORS] Computed for {len(park_df)} stadiums")
-    for outcome in OUTCOMES:
-        col = f"park_{outcome}_factor"
-        if col in park_df.columns and len(park_df) > 0:
-            print(f"  {outcome}: min={park_df[col].min():.3f}, max={park_df[col].max():.3f}, mean={park_df[col].mean():.3f}")
-
-    return park_df
-
-
 # =========================
 # Pitch-Type Statcast Block
 # =========================
-
-# Statcast columns used for pitcher characteristics per pitch type
-_PITCHER_STATCAST_COLS = [
-    "release_speed", "release_spin_rate", "pfx_x", "pfx_z", "plate_x", "plate_z",
-]
-
-# Per pitch type, the full column set for the feature block (9 per pitch type)
-def _pitchtype_statcast_feature_names():
-    """Return the 90 feature column names in deterministic order."""
-    cols = []
-    for pt in PITCH_TYPES:
-        cols.append(f"pitcher_pitch_rate_{pt}")
-        for stat in _PITCHER_STATCAST_COLS:
-            cols.append(f"pitcher_{pt}_{stat}")
-        cols.append(f"batter_{pt}_launch_speed")
-        cols.append(f"batter_{pt}_launch_angle")
-    return cols
-
-
-def compute_pitchtype_statcast_block(input_csv: str, split_info: SplitInfo):
-    """
-    Compute TRAIN-only pitcher statcast stats and batter contact quality per pitch type.
-
-    Returns:
-        pitcher_wide: DataFrame keyed by pitcher_id (str) with 70 columns
-                      (7 per pitch type: rate + 6 statcast means)
-        batter_wide:  DataFrame keyed by batter_id (str) with 20 columns
-                      (2 per pitch type: launch_speed, launch_angle)
-    """
-    print("[PITCHTYPE STATCAST] Computing TRAIN-only pitch-type statcast block...")
-    train_end = pd.to_datetime(split_info.train_end_date)
-
-    # Accumulators: pitcher-side (all pitches in train)
-    pitcher_records = []  # list of dicts
-    # Accumulators: batter-side (PA-ending pitches only)
-    batter_records = []
-
-    for i, chunk in enumerate(pd.read_csv(input_csv, chunksize=READ_CHUNK_ROWS, low_memory=True)):
-        chunk[GAME_DATE_COL] = pd.to_datetime(chunk[GAME_DATE_COL], errors="coerce").dt.normalize()
-        # Train only
-        train_mask = chunk[GAME_DATE_COL].notna() & (chunk[GAME_DATE_COL] <= train_end)
-        df = chunk.loc[train_mask].copy()
-        if df.empty:
-            continue
-
-        # Bin pitch types
-        df["pt_bin"] = _pitch_type_bin(df[PITCH_TYPE_COL])
-
-        # --- Pitcher side: ALL pitches ---
-        for col in _PITCHER_STATCAST_COLS:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            else:
-                df[col] = np.nan
-
-        pitcher_agg = df.groupby([PITCHER_ID_COL, "pt_bin"]).agg(
-            n_pitches=("pt_bin", "size"),
-            **{f"sum_{c}": (c, "sum") for c in _PITCHER_STATCAST_COLS},
-            **{f"cnt_{c}": (c, "count") for c in _PITCHER_STATCAST_COLS},  # non-NaN count
-        ).reset_index()
-        pitcher_records.append(pitcher_agg)
-
-        # --- Batter side: PA-ending pitches only ---
-        if "is_last_pitch_of_pa" in df.columns:
-            is_last = pd.to_numeric(df["is_last_pitch_of_pa"], errors="coerce").fillna(0).astype("int64")
-        elif "pitch_number_in_pa" in df.columns and "pa_id" in df.columns:
-            max_pitch = df.groupby("pa_id")["pitch_number_in_pa"].transform("max")
-            is_last = (df["pitch_number_in_pa"] == max_pitch).astype("int64")
-        else:
-            # Fallback: treat all as PA-ending
-            is_last = pd.Series(1, index=df.index)
-
-        pa_df = df.loc[is_last == 1].copy()
-        if not pa_df.empty:
-            for col in ["launch_speed", "launch_angle"]:
-                if col in pa_df.columns:
-                    pa_df[col] = pd.to_numeric(pa_df[col], errors="coerce")
-                else:
-                    pa_df[col] = np.nan
-
-            batter_agg = pa_df.groupby([BATTER_ID_COL, "pt_bin"]).agg(
-                sum_launch_speed=("launch_speed", "sum"),
-                cnt_launch_speed=("launch_speed", "count"),
-                sum_launch_angle=("launch_angle", "sum"),
-                cnt_launch_angle=("launch_angle", "count"),
-            ).reset_index()
-            batter_records.append(batter_agg)
-
-        if (i + 1) % 5 == 0:
-            print(f"  [PITCHTYPE STATCAST] processed {(i+1)*READ_CHUNK_ROWS:,} rows...")
-
-    # --- Aggregate across chunks ---
-    # Pitcher
-    pitcher_all = pd.concat(pitcher_records, ignore_index=True)
-    pitcher_all = pitcher_all.groupby([PITCHER_ID_COL, "pt_bin"]).sum(numeric_only=True).reset_index()
-
-    # Compute means
-    for c in _PITCHER_STATCAST_COLS:
-        pitcher_all[f"mean_{c}"] = pitcher_all[f"sum_{c}"] / pitcher_all[f"cnt_{c}"].replace(0, np.nan)
-
-    # Compute pitch rates
-    pitcher_total = pitcher_all.groupby(PITCHER_ID_COL)["n_pitches"].transform("sum")
-    pitcher_all["pitch_rate"] = pitcher_all["n_pitches"] / pitcher_total.replace(0, np.nan)
-
-    # Pitcher overall means (fallback for missing pitch types)
-    pitcher_overall_cols = {}
-    for c in _PITCHER_STATCAST_COLS:
-        overall = pitcher_all.groupby(PITCHER_ID_COL).apply(
-            lambda g: g[f"sum_{c}"].sum() / max(g[f"cnt_{c}"].sum(), 1), include_groups=False
-        )
-        pitcher_overall_cols[c] = overall
-
-    # Pivot pitcher wide
-    pitcher_wide_parts = []
-    for pt in PITCH_TYPES:
-        pt_data = pitcher_all.loc[pitcher_all["pt_bin"] == pt].set_index(PITCHER_ID_COL)
-        pt_df = pd.DataFrame(index=pt_data.index)
-        pt_df[f"pitcher_pitch_rate_{pt}"] = pt_data["pitch_rate"]
-        for c in _PITCHER_STATCAST_COLS:
-            pt_df[f"pitcher_{pt}_{c}"] = pt_data[f"mean_{c}"]
-        pitcher_wide_parts.append(pt_df)
-
-    pitcher_wide = pd.concat(pitcher_wide_parts, axis=1)
-    # Get all unique pitcher IDs
-    all_pitchers = pitcher_all[PITCHER_ID_COL].unique()
-    pitcher_wide = pitcher_wide.reindex(all_pitchers)
-
-    # Fill missing pitch rates with 0
-    for pt in PITCH_TYPES:
-        rate_col = f"pitcher_pitch_rate_{pt}"
-        pitcher_wide[rate_col] = pitcher_wide[rate_col].fillna(0.0)
-
-    # Fill missing statcast means with pitcher overall
-    for pt in PITCH_TYPES:
-        for c in _PITCHER_STATCAST_COLS:
-            col = f"pitcher_{pt}_{c}"
-            mask = pitcher_wide[col].isna()
-            if mask.any():
-                overall = pitcher_overall_cols[c]
-                pitcher_wide.loc[mask, col] = pitcher_wide.index[mask].map(overall)
-            # Final fill with 0 for pitchers with no data at all for this stat
-            pitcher_wide[col] = pitcher_wide[col].fillna(0.0)
-
-    pitcher_wide.index.name = PITCHER_ID_COL
-    pitcher_wide = pitcher_wide.astype("float32")
-
-    # --- Batter ---
-    batter_all = pd.concat(batter_records, ignore_index=True)
-    batter_all = batter_all.groupby([BATTER_ID_COL, "pt_bin"]).sum(numeric_only=True).reset_index()
-
-    batter_all["mean_launch_speed"] = batter_all["sum_launch_speed"] / batter_all["cnt_launch_speed"].replace(0, np.nan)
-    batter_all["mean_launch_angle"] = batter_all["sum_launch_angle"] / batter_all["cnt_launch_angle"].replace(0, np.nan)
-
-    # Batter overall means (fallback)
-    batter_overall_ls = batter_all.groupby(BATTER_ID_COL).apply(
-        lambda g: g["sum_launch_speed"].sum() / max(g["cnt_launch_speed"].sum(), 1), include_groups=False
-    )
-    batter_overall_la = batter_all.groupby(BATTER_ID_COL).apply(
-        lambda g: g["sum_launch_angle"].sum() / max(g["cnt_launch_angle"].sum(), 1), include_groups=False
-    )
-
-    # Pivot batter wide
-    batter_wide_parts = []
-    for pt in PITCH_TYPES:
-        pt_data = batter_all.loc[batter_all["pt_bin"] == pt].set_index(BATTER_ID_COL)
-        pt_df = pd.DataFrame(index=pt_data.index)
-        pt_df[f"batter_{pt}_launch_speed"] = pt_data["mean_launch_speed"]
-        pt_df[f"batter_{pt}_launch_angle"] = pt_data["mean_launch_angle"]
-        batter_wide_parts.append(pt_df)
-
-    all_batters = batter_all[BATTER_ID_COL].unique()
-    batter_wide = pd.concat(batter_wide_parts, axis=1)
-    batter_wide = batter_wide.reindex(all_batters)
-
-    # Fill missing with batter overall
-    for pt in PITCH_TYPES:
-        ls_col = f"batter_{pt}_launch_speed"
-        la_col = f"batter_{pt}_launch_angle"
-        mask_ls = batter_wide[ls_col].isna()
-        mask_la = batter_wide[la_col].isna()
-        if mask_ls.any():
-            batter_wide.loc[mask_ls, ls_col] = batter_wide.index[mask_ls].map(batter_overall_ls)
-        if mask_la.any():
-            batter_wide.loc[mask_la, la_col] = batter_wide.index[mask_la].map(batter_overall_la)
-        batter_wide[ls_col] = batter_wide[ls_col].fillna(0.0)
-        batter_wide[la_col] = batter_wide[la_col].fillna(0.0)
-
-    batter_wide.index.name = BATTER_ID_COL
-    batter_wide = batter_wide.astype("float32")
-
-    print(f"[PITCHTYPE STATCAST] Done. Pitcher: {len(pitcher_wide)} rows x {len(pitcher_wide.columns)} cols, "
-          f"Batter: {len(batter_wide)} rows x {len(batter_wide.columns)} cols")
-
-    return pitcher_wide, batter_wide
 
 
 # =========================
@@ -2087,141 +1424,18 @@ def _build_feature_list():
             "ext_vector_disagreement",
         ])
 
-    if ENABLE_BUCKET_FEATURES:
-        for prefix in ["batter", "pitcher", "matchup"]:
-            for outcome in OUTCOMES:
-                numeric_cols.append(f"{prefix}_{outcome}_expected")
-
-    if ENABLE_PARK_FACTORS:
-        for outcome in OUTCOMES:
-            numeric_cols.append(f"park_{outcome}_factor")
-
-    if ENABLE_BUCKET_FEATURES:
-        numeric_cols.extend(["batter_log_n", "pitcher_log_n"])
-
-    if ENABLE_PITCHTYPE_STATCAST_BLOCK:
-        numeric_cols.extend(_pitchtype_statcast_feature_names())
-
     if ENABLE_PITCHTYPE_STATCAST_V2:
         numeric_cols.extend(_pitchtype_statcast_v2_feature_names())
 
     return categorical_cols, numeric_cols
 
 
-def _compute_matchup_features(
-    pa_chunk: pd.DataFrame,
-    batter_tend: pd.DataFrame,
-    pitcher_tend: pd.DataFrame,
-    park_factors: pd.DataFrame,
-    league_fallback: Dict,
-) -> pd.DataFrame:
-    """
-    Compute PA-level features:
-    1. Bucket-weighted expected rates (18 features) - from 40 buckets (if enabled)
-    2. Park factors (6 features) (if enabled)
-    3. Uncertainty (2 features) (if bucket features enabled)
-
-    Note: stand and p_throws are handled as categorical columns, not here.
-    Respects ENABLE_BUCKET_FEATURES and ENABLE_PARK_FACTORS toggles.
-    """
-    outcomes = league_fallback["outcomes"]
-    league_rates = np.array(league_fallback["league_rates"], dtype=np.float32)
-
-    n_pa = len(pa_chunk)
-    features = {}
-
-    # =====================================================
-    # PART 1: Bucket-weighted expected rates (40 buckets)
-    # =====================================================
-    if ENABLE_BUCKET_FEATURES:
-        batter_map = batter_tend.set_index("batter_id") if not batter_tend.empty else pd.DataFrame()
-        pitcher_map = pitcher_tend.set_index("pitcher_id") if not pitcher_tend.empty else pd.DataFrame()
-
-        b_ids = pa_chunk["batter_id"].values
-        p_ids = pa_chunk["pitcher_id"].values
-
-        batter_rows = batter_map.reindex(b_ids) if not batter_map.empty else pd.DataFrame(index=range(n_pa))
-        pitcher_rows = pitcher_map.reindex(p_ids) if not pitcher_map.empty else pd.DataFrame(index=range(n_pa))
-
-        for oi, outcome in enumerate(outcomes):
-            batter_weighted = np.zeros(n_pa, dtype=np.float32)
-            pitcher_weighted = np.zeros(n_pa, dtype=np.float32)
-            matchup_weighted = np.zeros(n_pa, dtype=np.float32)
-            total_usage = np.zeros(n_pa, dtype=np.float32)
-
-            for bucket in ALL_BUCKETS:
-                bucket_safe = bucket.replace("|", "_")
-
-                # Pitcher usage
-                usage_col = f"pitcher_usage_{bucket_safe}"
-                if usage_col in pitcher_rows.columns:
-                    usage = pitcher_rows[usage_col].fillna(1.0 / len(ALL_BUCKETS)).values
-                else:
-                    usage = np.full(n_pa, 1.0 / len(ALL_BUCKETS), dtype=np.float32)
-
-                # Batter bucket rate
-                b_col = f"batter_{outcome}_{bucket_safe}"
-                if b_col in batter_rows.columns:
-                    b_rate = batter_rows[b_col].fillna(league_rates[oi]).values
-                else:
-                    b_rate = np.full(n_pa, league_rates[oi], dtype=np.float32)
-
-                # Pitcher bucket rate
-                p_col = f"pitcher_{outcome}_{bucket_safe}"
-                if p_col in pitcher_rows.columns:
-                    p_rate = pitcher_rows[p_col].fillna(league_rates[oi]).values
-                else:
-                    p_rate = np.full(n_pa, league_rates[oi], dtype=np.float32)
-
-                # Accumulate
-                batter_weighted += b_rate * usage
-                pitcher_weighted += p_rate * usage
-                matchup_weighted += (b_rate * p_rate / (league_rates[oi] + 1e-8)) * usage
-                total_usage += usage
-
-            total_usage = np.maximum(total_usage, 1e-8)
-
-            features[f"batter_{outcome}_expected"] = (batter_weighted / total_usage).astype(np.float32)
-            features[f"pitcher_{outcome}_expected"] = (pitcher_weighted / total_usage).astype(np.float32)
-            features[f"matchup_{outcome}_expected"] = (matchup_weighted / total_usage).astype(np.float32)
-
-        # Uncertainty features
-        if "batter_n_pa" in batter_rows.columns:
-            features["batter_log_n"] = np.log1p(batter_rows["batter_n_pa"].fillna(0).values).astype(np.float32)
-        else:
-            features["batter_log_n"] = np.zeros(n_pa, dtype=np.float32)
-
-        if "pitcher_n_pa" in pitcher_rows.columns:
-            features["pitcher_log_n"] = np.log1p(pitcher_rows["pitcher_n_pa"].fillna(0).values).astype(np.float32)
-        else:
-            features["pitcher_log_n"] = np.zeros(n_pa, dtype=np.float32)
-
-    # =====================================================
-    # PART 2: Park factors (6 features)
-    # =====================================================
-    if ENABLE_PARK_FACTORS:
-        park_map = park_factors.set_index("stadium_id") if (not park_factors.empty and "stadium_id" in park_factors.columns) else pd.DataFrame()
-        s_ids = pa_chunk["stadium_id"].astype("string").values
-        park_rows = park_map.reindex(s_ids) if not park_map.empty else pd.DataFrame(index=range(n_pa))
-
-        for outcome in outcomes:
-            col = f"park_{outcome}_factor"
-            if col in park_rows.columns:
-                features[col] = park_rows[col].fillna(1.0).values.astype(np.float32)
-            else:
-                features[col] = np.ones(n_pa, dtype=np.float32)
-
-    return pd.DataFrame(features, index=pa_chunk.index)
 
 
 def pass3_write_pa_splits(
     input_csv: str,
     split_info: SplitInfo,
     vocabs: Dict[str, Dict[str, int]],
-    batter_tend: pd.DataFrame,
-    pitcher_tend: pd.DataFrame,
-    park_factors: pd.DataFrame,
-    league_fallback: Dict,
     six_vector_stats: Optional[Dict],
     output_format: str,
     pitchtype_statcast: Optional[Tuple[pd.DataFrame, pd.DataFrame]] = None,
@@ -2240,7 +1454,7 @@ def pass3_write_pa_splits(
 
     # Dynamic feature lists based on toggles
     categorical_cols, numeric_feature_cols = _build_feature_list()
-    print(f"  [PASS 3] Feature toggles: SIX_VECTORS={ENABLE_SIX_VECTORS}, EMBEDDINGS={ENABLE_EMBEDDINGS}, BUCKET={ENABLE_BUCKET_FEATURES}, PARK={ENABLE_PARK_FACTORS}")
+    print(f"  [PASS 3] Feature toggles: SIX_VECTORS={ENABLE_SIX_VECTORS}, EMBEDDINGS={ENABLE_EMBEDDINGS}")
     print(f"  [PASS 3] Categorical features ({len(categorical_cols)}): {categorical_cols}")
     print(f"  [PASS 3] Numeric features ({len(numeric_feature_cols)}): {numeric_feature_cols}")
 
@@ -2322,34 +1536,6 @@ def pass3_write_pa_splits(
                 for col in six_vector_features.columns:
                     pa_chunk[col] = six_vector_features[col].values
 
-            # Compute matchup features (bucket-weighted + park factors + uncertainty)
-            if ENABLE_BUCKET_FEATURES or ENABLE_PARK_FACTORS:
-                matchup_features = _compute_matchup_features(
-                    pa_chunk,
-                    batter_tend,
-                    pitcher_tend,
-                    park_factors,
-                    league_fallback,
-                )
-                for col in matchup_features.columns:
-                    pa_chunk[col] = matchup_features[col].values
-
-            # Merge pitch-type statcast block (before categorical encoding, needs string IDs)
-            if ENABLE_PITCHTYPE_STATCAST_BLOCK and pitchtype_statcast is not None:
-                pitcher_wide, batter_wide = pitchtype_statcast
-                pid_str = pa_chunk[PITCHER_ID_COL].astype("string")
-                bid_str = pa_chunk[BATTER_ID_COL].astype("string")
-                # Pitcher side
-                pitcher_matched = pitcher_wide.reindex(pid_str.values)
-                pitcher_matched.index = pa_chunk.index
-                for col in pitcher_wide.columns:
-                    pa_chunk[col] = pitcher_matched[col].fillna(0.0).astype("float32").values
-                # Batter side
-                batter_matched = batter_wide.reindex(bid_str.values)
-                batter_matched.index = pa_chunk.index
-                for col in batter_wide.columns:
-                    pa_chunk[col] = batter_matched[col].fillna(0.0).astype("float32").values
-
             # Merge pitch-type statcast v2 block
             if ENABLE_PITCHTYPE_STATCAST_V2 and pitchtype_statcast_v2 is not None:
                 pitcher_wide_v2, batter_wide_v2 = pitchtype_statcast_v2
@@ -2417,7 +1603,7 @@ def pass3_write_pa_splits(
 # Metadata writer
 # =========================
 
-def write_metadata_json(fit: FitStats, transform_summary: Dict[str, object], league_fallback: Dict) -> str:
+def write_metadata_json(fit: FitStats, transform_summary: Dict[str, object]) -> str:
     # Vocab sizes (include PAD=0 and UNK=1)
     vocab_sizes = {k: len(v) for k, v in fit.vocabs.items()}
 
@@ -2458,14 +1644,11 @@ def write_metadata_json(fit: FitStats, transform_summary: Dict[str, object], lea
             "all_buckets": list(ALL_BUCKETS),
             "pitch_types": list(PITCH_TYPES),
             "zone_tiers": list(ZONE_TIERS),
-            "smoothing_alpha": league_fallback.get("smoothing_alpha", TENDENCY_ALPHA),
+            "smoothing_alpha": TENDENCY_ALPHA,
         },
         "feature_toggles": {
             "ENABLE_SIX_VECTORS": ENABLE_SIX_VECTORS,
             "ENABLE_EMBEDDINGS": ENABLE_EMBEDDINGS,
-            "ENABLE_BUCKET_FEATURES": ENABLE_BUCKET_FEATURES,
-            "ENABLE_PARK_FACTORS": ENABLE_PARK_FACTORS,
-            "ENABLE_PITCHTYPE_STATCAST_BLOCK": ENABLE_PITCHTYPE_STATCAST_BLOCK,
             "ENABLE_PITCHTYPE_STATCAST_V2": ENABLE_PITCHTYPE_STATCAST_V2,
         },
     }
@@ -2482,15 +1665,13 @@ def write_metadata_json(fit: FitStats, transform_summary: Dict[str, object], lea
 # =========================
 
 def main() -> None:
-    global INPUT_CSV, OUTPUT_DIR, OUTPUT_FORMAT, ENABLE_PITCHTYPE_STATCAST_BLOCK, ENABLE_PITCHTYPE_STATCAST_V2
+    global INPUT_CSV, OUTPUT_DIR, OUTPUT_FORMAT, ENABLE_PITCHTYPE_STATCAST_V2
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_csv", type=str, default=INPUT_CSV)
     parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR)
     parser.add_argument("--output_format", type=str, default=OUTPUT_FORMAT, choices=["csv", "parquet"])
     parser.add_argument("--train_end_date", type=str, default=TRAIN_END_DATE)
     parser.add_argument("--val_end_date", type=str, default=VAL_END_DATE)
-    parser.add_argument("--enable_pitchtype_statcast_block", action="store_true", default=False,
-                        help="Enable pitch-type statcast feature block (90 extra numeric cols)")
     parser.add_argument("--enable_pitchtype_statcast_v2", action="store_true", default=False,
                         help="Enable pitch-type statcast v2 block (210 extra numeric cols)")
     args = parser.parse_args()
@@ -2498,8 +1679,6 @@ def main() -> None:
     INPUT_CSV = args.input_csv
     OUTPUT_DIR = args.output_dir
     OUTPUT_FORMAT = args.output_format
-    if args.enable_pitchtype_statcast_block:
-        ENABLE_PITCHTYPE_STATCAST_BLOCK = True
     if args.enable_pitchtype_statcast_v2:
         ENABLE_PITCHTYPE_STATCAST_V2 = True
 
@@ -2514,31 +1693,6 @@ def main() -> None:
     vocabs_path = os.path.join(OUTPUT_DIR, "vocabs.json")
     with open(vocabs_path, "w", encoding="utf-8") as f:
         json.dump(vocabs, f, indent=2, sort_keys=True)
-
-    # PASS 2: Fit PA-ending tendencies (old bucket system) - only if needed
-    batter_tend_df = pd.DataFrame()
-    pitcher_tend_df = pd.DataFrame()
-    league_fallback = {"outcomes": OUTCOMES, "league_rates": [1.0 / len(OUTCOMES)] * len(OUTCOMES)}
-    batter_path = ""
-    pitcher_path = ""
-    fallback_path = ""
-
-    if ENABLE_BUCKET_FEATURES:
-        batter_tend_df, pitcher_tend_df, league_fallback = pass2_fit_pa_ending_tendencies(
-            INPUT_CSV, split_info, alpha=TENDENCY_ALPHA
-        )
-        batter_path = _write_table(batter_tend_df, os.path.join(OUTPUT_DIR, "batter_tendencies"), OUTPUT_FORMAT)
-        pitcher_path = _write_table(pitcher_tend_df, os.path.join(OUTPUT_DIR, "pitcher_tendencies"), OUTPUT_FORMAT)
-        fallback_path = os.path.join(OUTPUT_DIR, "league_fallback.json")
-        with open(fallback_path, "w", encoding="utf-8") as f:
-            json.dump(league_fallback, f, indent=2, sort_keys=False)
-
-    # Compute park factors (old system) - only if needed
-    park_factors_df = pd.DataFrame()
-    park_factors_path = ""
-    if ENABLE_PARK_FACTORS:
-        park_factors_df = _compute_park_factors(INPUT_CSV, split_info, alpha=5.0)
-        park_factors_path = _write_table(park_factors_df, os.path.join(OUTPUT_DIR, "park_factors"), OUTPUT_FORMAT)
 
     # PASS 2b: Compute six-vector statistics (new system)
     six_vector_stats = None
@@ -2567,15 +1721,6 @@ def main() -> None:
                 "logodds": six_vector_stats["league_logodds"].tolist(),
             }, f, indent=2)
 
-    # Compute pitch-type statcast block (if enabled)
-    pitchtype_statcast = None
-    if ENABLE_PITCHTYPE_STATCAST_BLOCK:
-        pitcher_wide, batter_wide = compute_pitchtype_statcast_block(INPUT_CSV, split_info)
-        pitchtype_statcast = (pitcher_wide, batter_wide)
-        # Save wide tables
-        _write_table(pitcher_wide.reset_index(), os.path.join(OUTPUT_DIR, "pitchtype_statcast_pitcher"), OUTPUT_FORMAT)
-        _write_table(batter_wide.reset_index(), os.path.join(OUTPUT_DIR, "pitchtype_statcast_batter"), OUTPUT_FORMAT)
-
     # Compute pitch-type statcast v2 block (if enabled)
     pitchtype_statcast_v2 = None
     if ENABLE_PITCHTYPE_STATCAST_V2:
@@ -2589,13 +1734,8 @@ def main() -> None:
         INPUT_CSV,
         split_info,
         vocabs,
-        batter_tend_df,
-        pitcher_tend_df,
-        park_factors_df,
-        league_fallback,
         six_vector_stats,
         OUTPUT_FORMAT,
-        pitchtype_statcast=pitchtype_statcast,
         pitchtype_statcast_v2=pitchtype_statcast_v2,
     )
 
@@ -2604,22 +1744,14 @@ def main() -> None:
         vocabs=vocabs,
         tendency_spec=tendency_spec,
         tendency_paths={
-            "batter_tendencies": batter_path,
-            "pitcher_tendencies": pitcher_path,
-            "park_factors": park_factors_path,
-            "league_fallback": fallback_path,
             "vocabs": vocabs_path,
         },
         output_columns=transform_summary["output_columns"],
     )
 
-    meta_path = write_metadata_json(fit, transform_summary, league_fallback)
+    meta_path = write_metadata_json(fit, transform_summary)
     print("[DONE] Wrote metadata:", meta_path)
     print("[DONE] Outputs:", transform_summary["split_paths"])
-    if ENABLE_BUCKET_FEATURES:
-        print("[DONE] Tendency tables:", batter_path, pitcher_path)
-    if ENABLE_PARK_FACTORS:
-        print("[DONE] Park factors:", park_factors_path)
     if ENABLE_SIX_VECTORS:
         print("[DONE] Six-vector stats saved to preprocessed/six_vector_*.parquet")
 
