@@ -33,25 +33,54 @@ html, body {
 
 #root { min-height: 100vh; display: flex; flex-direction: column; }
 
-/* ── Background layer ─────────────────────────────────────────── */
-.bg-layer {
+/* ── Background layers ────────────────────────────────────────── */
+.bg-gradient {
   position: fixed;
   inset: 0;
   z-index: 0;
-  transition: background var(--transition), opacity var(--transition);
+  transition: background 0.5s ease;
   pointer-events: none;
+}
+
+.bg-photo {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  background-size: cover;
+  background-position: center;
+  opacity: 0;
+  transition: opacity 0.5s ease;
+  pointer-events: none;
+}
+
+.bg-photo.loaded {
+  opacity: 1;
+}
+
+.bg-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  background: rgba(0, 0, 0, 0);
+  transition: background 0.5s ease;
+  pointer-events: none;
+}
+
+.bg-overlay.active {
+  background: rgba(0, 0, 0, 0.58);
 }
 
 /* ── Layout ───────────────────────────────────────────────────── */
 .app-shell {
   position: relative;
-  z-index: 1;
+  z-index: 3;
   display: flex;
   flex-direction: column;
   min-height: 100vh;
 }
 
 .app-header {
+  position: relative;
   text-align: center;
   padding: 32px 24px 16px;
   border-bottom: 1px solid var(--border);
@@ -76,6 +105,60 @@ html, body {
   text-transform: uppercase;
 }
 
+/* ── Navigation tabs ──────────────────────────────────────────── */
+.header-tabs {
+  position: absolute;
+  right: 24px;
+  bottom: 16px;
+  display: flex;
+  gap: 2px;
+}
+
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-secondary);
+  font-family: 'Oswald', sans-serif;
+  font-size: 0.82rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 6px 14px 4px;
+  cursor: pointer;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition: color 0.2s, background 0.2s, border-color 0.2s;
+}
+
+.tab-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255,255,255,0.05);
+}
+
+.tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* ── About page ───────────────────────────────────────────────── */
+.about-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 96px 24px 48px;
+}
+
+.about-page h2 {
+  font-family: 'Oswald', sans-serif;
+  font-size: clamp(1.6rem, 3vw, 2.2rem);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+
+/* ── Main content area ────────────────────────────────────────── */
 .app-main {
   flex: 1;
   display: flex;
@@ -173,7 +256,7 @@ html, body {
   font-weight: 500;
 }
 
-/* Search input + dropdown */
+/* ── Search input + dropdown ──────────────────────────────────── */
 .player-search-wrap {
   position: relative;
 }
@@ -204,13 +287,24 @@ html, body {
   overflow: hidden;
   z-index: 100;
   box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.search-dropdown-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 8px 14px 4px;
+  font-family: 'Oswald', sans-serif;
 }
 
 .search-result {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
+  gap: 10px;
+  padding: 8px 14px;
   cursor: pointer;
   transition: background 0.15s;
   border-bottom: 1px solid var(--border);
@@ -218,6 +312,15 @@ html, body {
 
 .search-result:last-child { border-bottom: none; }
 .search-result:hover { background: var(--surface-hover); }
+
+.search-result-photo {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: rgba(255,255,255,0.06);
+}
 
 .search-result-name {
   font-size: 0.9rem;
@@ -234,7 +337,7 @@ html, body {
   white-space: nowrap;
 }
 
-/* Player photo area */
+/* ── Player photo area ────────────────────────────────────────── */
 .player-photo-wrap {
   display: flex;
   flex-direction: column;
@@ -338,7 +441,7 @@ html, body {
 /* ── Results display ──────────────────────────────────────────── */
 .results-section {
   width: 100%;
-  max-width: 720px;
+  max-width: 960px;
 }
 
 .results-header {
@@ -363,21 +466,20 @@ html, body {
   color: var(--text-primary);
 }
 
-.results-table {
-  display: flex;
-  flex-direction: column;
+.results-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
   gap: 10px;
 }
 
-.result-row {
+.result-card {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 14px 16px;
-  display: grid;
-  grid-template-columns: 120px 1fr 80px;
-  gap: 12px;
-  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .result-label {
@@ -445,7 +547,7 @@ html, body {
 }
 
 .result-delta {
-  text-align: right;
+  text-align: left;
   font-family: 'Oswald', sans-serif;
   font-size: 1rem;
   font-weight: 600;
@@ -461,7 +563,12 @@ html, body {
     grid-template-columns: 1fr;
   }
   .vs-divider { display: none; }
-  .result-row {
-    grid-template-columns: 1fr;
+  .results-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+  .header-tabs {
+    position: static;
+    justify-content: center;
+    margin-top: 12px;
   }
 }

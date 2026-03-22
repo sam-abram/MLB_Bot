@@ -12,15 +12,15 @@ STADIUM_INFO: Dict[str, tuple] = {
     "ATH": ("Sutter Health Park",        "Athletics"),
     "ATL": ("Truist Park",               "Braves"),
     "AZ":  ("Chase Field",               "Diamondbacks"),
-    "BAL": ("Camden Yards",              "Orioles"),
+    "BAL": ("Oriole Park at Camden Yards", "Orioles"),
     "BOS": ("Fenway Park",               "Red Sox"),
     "CHC": ("Wrigley Field",             "Cubs"),
     "CIN": ("Great American Ball Park",  "Reds"),
     "CLE": ("Progressive Field",         "Guardians"),
     "COL": ("Coors Field",               "Rockies"),
-    "CWS": ("Guaranteed Rate Field",     "White Sox"),
+    "CWS": ("Rate Field",                "White Sox"),
     "DET": ("Comerica Park",             "Tigers"),
-    "HOU": ("Minute Maid Park",          "Astros"),
+    "HOU": ("Daikin Park",               "Astros"),
     "KC":  ("Kauffman Stadium",          "Royals"),
     "LAA": ("Angel Stadium",             "Angels"),
     "LAD": ("Dodger Stadium",            "Dodgers"),
@@ -67,16 +67,15 @@ def search_players(
 ) -> List[dict]:
     """
     Substring search on normalized names. Returns top `limit` matches.
+    Empty query returns top players by PA count (default/featured list).
     Each result: {name, mlbam_id, in_vocab, pa_count}.
     """
-    if len(query.strip()) < 2:
-        return []
-
     q = _norm(query)
     results = []
 
     for norm_name, entry in player_index.items():
-        if q not in norm_name:
+        # When query provided, filter by substring; otherwise include everyone
+        if q and q not in norm_name:
             continue
         mlbam_id = int(entry["id"])
         pa = pa_counts.get(mlbam_id, 0.0)
@@ -95,4 +94,6 @@ def search_players(
     # Sort: in-vocab first, then by pa_count descending, then name
     filtered.sort(key=lambda r: (-int(r["in_vocab"]), -r["pa_count"], r["name"]))
 
-    return filtered[:limit]
+    # Return more results for default (empty query) featured list
+    effective_limit = max(limit, 20) if not q else limit
+    return filtered[:effective_limit]

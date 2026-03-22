@@ -24,7 +24,20 @@
       "Bash(done)",
       "Bash(echo === $task_file done ===:*)",
       "Bash(source:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(python -c \":*)",
+      "Bash(rm -f analyze_embedding_content.py compare_models.py data_pipeline.py eval_baselines.py evaluate_checklist_modelG.py preprocessing.py train_model.py train_model2_patched.py train_logit_hybrid_test.py verify_data.py verify_vector_weights.py verify_vector_weights_v2.py test_bot.py)",
+      "Bash(rm -f mappings.pkl processed_data.pt nul mlb_pa_data_defense.csv small_test_statcast_pitch_level.csv test_statcast_pitch_level.csv test2_statcast_pitch_level.csv test3_statcast_pitch_level.csv test4_statcast_pitch_level.csv test5_statcast_pitch_level.csv test6_statcast_pa_level.csv test6_statcast_pitch_level.csv test7_statcast_pa_level.csv test7_statcast_pitch_level.csv test8_statcast_pa_level.csv test8_statcast_pitch_level.csv test9_statcast_pa_level.csv test9_statcast_pitch_level.csv test9_statcast_pitch_level_FIXED.csv)",
+      "Bash(rm -rf artifacts_ablation_k100 artifacts_ablation_k200 artifacts_ablation_vectoronly_k100 artifacts_ablation_vectoronly_k150 artifacts_ablation_vectoronly_k200 artifacts_comparison_hybrid artifacts_comparison_perclass artifacts_gate_ctx_k150 artifacts_gate_perclass_k150 artifacts_logodds_test artifacts_modelG_2023_to_2025mid_test_rest2025 artifacts_modelG_alldata_2023_2025 artifacts_shrinkage_alldata artifacts_shrinkage_midseason_hybrid artifacts_shrinkage_midseason_perclass artifacts_sigmoid_alldata artifacts_vectoronly_alldata)",
+      "Bash(rm -rf model_artifacts_ctx_gate model_artifacts_logit_hybrid model_artifacts_modelG model_artifacts_perclass_gate model_artifacts_pitchtype_statcast model_artifacts_ptstatcast_v2)",
+      "Bash(rm -rf preprocessed_2023_to_2025mid_test_rest2025 preprocessed_alldata_2023_2025 preprocessed_comparison preprocessed_eval_temp preprocessed_k100 preprocessed_k200 preprocessed_logodds_test preprocessed_modelG preprocessed_pitchtype_statcast preprocessed_ptstatcast_v2 preprocessed_shrinkage_alldata preprocessed_shrinkage_midseason preprocessed_test3 preprocessed_test4 preprocessed_test5 preprocessed_test6 preprocessed_test7 preprocessed_test8)",
+      "Bash(rm -rf out __pycache__)",
+      "Bash(npm install:*)",
+      "Bash(npm run:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker --version)",
+      "Bash(docker compose:*)",
+      "Bash(node -e \":*)"
     ]
   }
 }

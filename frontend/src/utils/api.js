@@ -7,15 +7,15 @@ export async function fetchStadiums() {
 }
 
 export async function searchBatters(q) {
-  if (!q || q.length < 2) return []
-  const res = await fetch(`${BASE}/search/batters?q=${encodeURIComponent(q)}`)
+  const url = q ? `${BASE}/search/batters?q=${encodeURIComponent(q)}` : `${BASE}/search/batters`
+  const res = await fetch(url)
   if (!res.ok) throw new Error('Search failed')
   return res.json()
 }
 
 export async function searchPitchers(q) {
-  if (!q || q.length < 2) return []
-  const res = await fetch(`${BASE}/search/pitchers?q=${encodeURIComponent(q)}`)
+  const url = q ? `${BASE}/search/pitchers?q=${encodeURIComponent(q)}` : `${BASE}/search/pitchers`
+  const res = await fetch(url)
   if (!res.ok) throw new Error('Search failed')
   return res.json()
 }

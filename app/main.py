@@ -95,7 +95,7 @@ def api_predict(req: PredictRequest):
         "BIPO": "Ball In Play Out",
         "BB":   "Walk / HBP",
         "1B":   "Single",
-        "XBH":  "Extra-Base Hit",
+        "XBH":  "Double / Triple",
         "HR":   "Home Run",
     }
 

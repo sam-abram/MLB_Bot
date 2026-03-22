@@ -27,10 +27,13 @@ function Bar({ prob, league, label }) {
   )
 }
 
+const ORDER = ['K', 'BIPO', 'BB', '1B', 'XBH', 'HR']
+
 export default function ResultsDisplay({ result }) {
   if (!result) return null
 
   const { outcomes, batter, pitcher, stadium } = result
+  const byCode = Object.fromEntries(outcomes.map((oc) => [oc.code, oc]))
 
   return (
     <div className="results-section">
@@ -41,8 +44,10 @@ export default function ResultsDisplay({ result }) {
         </span>
       </div>
 
-      <div className="results-table">
-        {outcomes.map((oc) => {
+      <div className="results-grid">
+        {ORDER.map((code) => {
+          const oc = byCode[code]
+          if (!oc) return null
           const sign = oc.vs_pct >= 0 ? '+' : ''
           const deltaClass =
             Math.abs(oc.vs_pct) < 2
@@ -52,7 +57,7 @@ export default function ResultsDisplay({ result }) {
               : 'negative'
 
           return (
-            <div key={oc.code} className="result-row">
+            <div key={oc.code} className="result-card">
               <div className="result-label">
                 <span className="result-label-name">{oc.name}</span>
                 <span className="result-label-code">{oc.code}</span>
