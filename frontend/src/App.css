@@ -446,9 +446,56 @@ html, body {
 
 .results-header {
   display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 20px;
+}
+
+.analytics-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.analytics-label {
+  font-family: 'Oswald', sans-serif;
+  font-size: 0.75rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.analytics-checkboxes {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.analytics-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.analytics-checkbox {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.results-title-group {
+  display: flex;
   align-items: baseline;
   gap: 12px;
-  margin-bottom: 20px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .results-title {
@@ -473,13 +520,34 @@ html, body {
 }
 
 .result-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: #ffffff;
+  border: 1px solid rgba(0,0,0,0.12);
   border-radius: var(--radius-sm);
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.result-card .result-label-name {
+  color: #1a1a2e;
+  font-weight: 700;
+}
+
+.result-card .result-label-code {
+  color: #555566;
+}
+
+.result-card .bar-track {
+  background: rgba(0,0,0,0.08);
+}
+
+.result-card .bar-label {
+  color: #333344;
+}
+
+.result-card .bar-tag {
+  color: #333344;
 }
 
 .result-label {
@@ -528,7 +596,7 @@ html, body {
   transition: width 0.5s ease;
 }
 
-.bar-fill.model   { background: var(--accent); }
+.bar-fill.model   { background: #00e676; }
 .bar-fill.league  { background: var(--text-muted); }
 
 .bar-label {
@@ -546,16 +614,6 @@ html, body {
   text-align: left;
 }
 
-.result-delta {
-  text-align: left;
-  font-family: 'Oswald', sans-serif;
-  font-size: 1rem;
-  font-weight: 600;
-}
-
-.result-delta.positive { color: var(--green); }
-.result-delta.negative { color: var(--red); }
-.result-delta.neutral  { color: var(--text-secondary); }
 
 /* ── Responsive ───────────────────────────────────────────────── */
 @media (max-width: 640px) {

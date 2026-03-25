@@ -233,8 +233,16 @@ def run_prediction(
         logits = ad.model(x_cat, x_num)
         probs = F.softmax(logits, dim=1).squeeze(0).tolist()
 
+    # Batter and pitcher overall rates (shrinkage-smoothed)
+    bo = _get_row(ad.sv_batter_overall,  "batter_id",  int(batter_raw_id))
+    po = _get_row(ad.sv_pitcher_overall, "pitcher_id", int(pitcher_raw_id))
+    batter_rates  = {oc: float(bo[f"batter_{oc}_rate"])  if bo  is not None and f"batter_{oc}_rate"  in bo.index  else ad.league_rates[i] for i, oc in enumerate(OUTCOMES)}
+    pitcher_rates = {oc: float(po[f"pitcher_{oc}_rate"]) if po  is not None and f"pitcher_{oc}_rate" in po.index else ad.league_rates[i] for i, oc in enumerate(OUTCOMES)}
+
     return {
         "probs": {label: float(p) for label, p in zip(ad.label_set, probs)},
+        "batter_rates":  batter_rates,
+        "pitcher_rates": pitcher_rates,
         "stand": stand,
         "p_throws": p_throws,
         "batter_in_vocab": str(batter_raw_id) in ad.batter_vocab,

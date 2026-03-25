@@ -88,7 +88,9 @@ def api_predict(req: PredictRequest):
         raise HTTPException(status_code=400, detail=f"Unknown stadium token: {req.stadium!r}")
 
     result = run_prediction(req.batter_id, req.pitcher_id, stadium_token, ad)
-    probs = result["probs"]
+    probs          = result["probs"]
+    batter_rates   = result["batter_rates"]
+    pitcher_rates  = result["pitcher_rates"]
 
     outcome_labels = {
         "K":    "Strikeout",
@@ -104,11 +106,13 @@ def api_predict(req: PredictRequest):
         league_avg = ad.league_rates[ad.label_set.index(label)]
         vs_pct = (prob - league_avg) / max(league_avg, 1e-9) * 100
         outcomes.append({
-            "code":        label,
-            "name":        outcome_labels.get(label, label),
-            "prob":        prob,
-            "league_avg":  league_avg,
-            "vs_pct":      vs_pct,
+            "code":         label,
+            "name":         outcome_labels.get(label, label),
+            "prob":         prob,
+            "league_avg":   league_avg,
+            "batter_avg":   batter_rates.get(label, league_avg),
+            "pitcher_avg":  pitcher_rates.get(label, league_avg),
+            "vs_pct":       vs_pct,
         })
 
     # Resolve display names from index

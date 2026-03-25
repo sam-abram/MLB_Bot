@@ -37,7 +37,9 @@
       "Bash(docker-compose up:*)",
       "Bash(docker --version)",
       "Bash(docker compose:*)",
-      "Bash(node -e \":*)"
+      "Bash(node -e \":*)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "Bash(curl -s -A \"Mozilla/5.0 \\(compatible; research-bot/1.0\\)\" \"https://en.wikipedia.org/api/rest_v1/page/summary/Yankee_Stadium\")"
     ]
   }
 }
