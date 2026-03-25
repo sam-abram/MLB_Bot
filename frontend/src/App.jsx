@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useState } from 'react'
 import StadiumSelector from './components/StadiumSelector'
 import PlayerCard from './components/PlayerCard'
 import PredictButton from './components/PredictButton'
@@ -24,12 +24,8 @@ export default function App() {
   const [result, setResult]         = useState(null)
   const [loading, setLoading]       = useState(false)
   const [error, setError]           = useState(null)
-  const [photoLoaded, setPhotoLoaded] = useState(false)
 
   const canPredict = batter && pitcher && stadium
-
-  // Reset photo state when stadium changes so new image crossfades in
-  useEffect(() => { setPhotoLoaded(false) }, [stadium])
 
   const handlePredict = useCallback(async () => {
     if (!canPredict) return
@@ -51,34 +47,16 @@ export default function App() {
   const handleSelectPitcher = useCallback((p) => { setPitcher(p); setResult(null) }, [])
   const handleStadiumChange = useCallback((t) => { setStadium(t); setResult(null) }, [])
 
-  const stadiumData = stadium ? STADIUM_COLORS[stadium] : null
-  const imageUrl    = stadiumData?.imageUrl ?? null
-
   return (
     <>
       {/* Gradient background layer (always visible) */}
-      <div className="bg-gradient" style={getBgGradient(stadium)} />
-
-      {/* Stadium photo background (fades in after image loads) */}
       <div
-        className={`bg-photo${photoLoaded ? ' loaded' : ''}`}
-        style={photoLoaded ? { backgroundImage: `url(${imageUrl})` } : {}}
+        className="bg-gradient"
+        style={activeTab === 'about'
+          ? { background: 'radial-gradient(ellipse at 20% 0%, #1a0a3a 0%, #0a0a1f 50%, #0a0a0f 100%)' }
+          : getBgGradient(stadium)
+        }
       />
-
-      {/* Dark overlay for readability when photo is shown */}
-      <div className={`bg-overlay${photoLoaded ? ' active' : ''}`} />
-
-      {/* Hidden preloader — remounts on stadium change to trigger fresh load */}
-      {imageUrl && (
-        <img
-          key={imageUrl}
-          src={imageUrl}
-          alt=""
-          style={{ display: 'none' }}
-          onLoad={() => setPhotoLoaded(true)}
-          onError={() => setPhotoLoaded(false)}
-        />
-      )}
 
       <div className="app-shell">
         <header className="app-header">
@@ -138,7 +116,32 @@ export default function App() {
           </main>
         ) : (
           <main className="about-page">
-            <h2>How It Works</h2>
+            <div className="about-container">
+              <div className="about-intro-space" />
+              <div className="about-columns">
+                <div />
+                <section className="about-section">
+                  <h2 className="about-heading">How It Works</h2>
+                  <div className="about-body">
+                    <p>The model is trained on every pitch thrown in Major League Baseball from 2023 through 2025 – 3 seasons of Statcast data covering velocity, spin, location, and outcomes for every plate appearance.</p>
+                    <p>The model first learns embeddings for every batter and pitcher in the league. These embeddings are numerical representations of players learned directly from outcomes, allowing the model to discover patterns on its own: which hitters are similar, which pitchers share tendencies, and how specific matchups play out. This is the part of the model that can pick up on subtleties that traditional statistics might miss.</p>
+                    <p>Alongside those embeddings, the model is fed a set of carefully constructed statistical features. For each matchup, the system makes its prediction using six different factors — the batter's overall rates, the pitcher's overall rates, the stadium's effect, each player's platoon split against the other's handedness, and how the pitcher's specific arsenal interacts with the batter's strengths and weaknesses. Each factor produces a full outcome distribution, and all six are expressed as deviations from the league average. A technique called Bayesian shrinkage ensures that a rookie with 50 plate appearances isn't treated with the same confidence as a ten-year veteran — small samples are pulled toward the league average, while established players' rates are trusted more.</p>
+                    <p>A learned gate sits between these two approaches, monitoring how much they agree or disagree. The gate forces the model to lean on statistical features where the data is clear, and gives the learned representations more influence when the numbers alone don't tell the full story.</p>
+                  </div>
+                </section>
+
+                <aside className="about-bio">
+                  <img
+                    src="/Adobe Express - file.png"
+                    alt="Sam Abramowicz"
+                    className="about-photo"
+                  />
+                  <div className="about-bio-text">
+                    <p>The MLB At-Bat Predictor was developed by <strong>Sam Abramowicz</strong>, a Mathematics and Computer Science student at the University of Virginia.</p>
+                  </div>
+                </aside>
+              </div>
+            </div>
           </main>
         )}
       </div>

@@ -55,7 +55,17 @@ export default function ResultsDisplay({ result }) {
     <div className="results-section">
       <div className="results-header">
         <div className="analytics-controls">
-          <span className="analytics-label">Analytics</span>
+          <div className="analytics-label-row">
+            <span className="analytics-label">Analytics</span>
+            <div className="info-icon-wrap">
+              <span className="info-icon">i</span>
+              <div className="info-tooltip">
+                <strong>League</strong> — how often each outcome occurs across all MLB plate appearances.<br />
+                <strong>Batter</strong> — how often each outcome occurs for the selected batter.<br />
+                <strong>Pitcher</strong> — how often each outcome occurs for the selected pitcher.
+              </div>
+            </div>
+          </div>
           <div className="analytics-checkboxes">
             {ANALYTICS_OPTIONS.map((opt) => (
               <label key={opt.key} className="analytics-checkbox-label">
@@ -93,7 +103,7 @@ export default function ResultsDisplay({ result }) {
             <div key={oc.code} className="result-card">
               <div className="result-label">
                 <span className="result-label-name">{oc.name}</span>
-                <span className="result-label-code">{oc.code === 'XBH' ? '2B/3B' : oc.code}</span>
+                <span className="result-label-code">{oc.code === 'XBH' ? '2B/3B' : oc.code === 'BB' ? 'BB / HBP' : oc.code}</span>
               </div>
               <Bar prob={oc.prob} comparisons={comparisons} />
             </div>
