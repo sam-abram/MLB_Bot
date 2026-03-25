@@ -30,5 +30,6 @@ export async function predict(batterId, pitcherId, stadium) {
     const err = await res.json().catch(() => ({}))
     throw new Error(err.detail || 'Prediction failed')
   }
+  umami.track('prediction')
   return res.json()
 }
