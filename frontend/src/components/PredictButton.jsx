@@ -7,6 +7,7 @@ export default function PredictButton({ disabled, loading, onClick }) {
         className={`predict-btn${loading ? ' loading' : ''}`}
         disabled={disabled || loading}
         onClick={onClick}
+        data-umami-event="predict-click"
       >
         {loading ? 'Predicting…' : 'Predict Matchup'}
       </button>
