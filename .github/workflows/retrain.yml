@@ -46,13 +46,10 @@ jobs:
         run: python data_pipeline2.py
 
       - name: Preprocess
-        run: python preprocessing2.py
-
-      - name: Preprocess
-        run: python preprocessing2.py
+        run: python preprocessing2.py --enable_pitchtype_statcast_v2
 
       - name: Train model
-        run: python train_model2.py
+        run: python train_model2.py --use_pitchtype_statcast_v2 --use_per_class_gate_logit
 
       - name: Upload versioned copy to S3
         if: ${{ success() }}
