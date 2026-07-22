@@ -48,6 +48,9 @@ jobs:
       - name: Preprocess
         run: python preprocessing2.py --enable_pitchtype_statcast_v2
 
+      - name: Rebuild player name / handedness caches
+        run: python build_caches.py
+
       - name: Train model
         run: python train_model2.py --use_pitchtype_statcast_v2 --use_per_class_gate_logit
 
