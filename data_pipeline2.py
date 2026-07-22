@@ -22,7 +22,7 @@ except ImportError as e:
 # Config (edit these)
 # =========================
 START_DT = "2023-03-30"   # inclusive, YYYY-MM-DD
-END_DT = "2025-09-28"     # inclusive, YYYY-MM-DD
+END_DT = os.environ.get("END_DT", "2026-07-22")  # inclusive, YYYY-MM-DD
 CHUNK_DAYS = 7            # inclusive chunk length
 # data_pipeline2.py (top config)
 OUTPUT_CSV = "statcast_pitches.csv"

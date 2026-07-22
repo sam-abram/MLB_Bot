@@ -39,7 +39,15 @@
       "Bash(docker compose:*)",
       "Bash(node -e \":*)",
       "WebFetch(domain:en.wikipedia.org)",
-      "Bash(curl -s -A \"Mozilla/5.0 \\(compatible; research-bot/1.0\\)\" \"https://en.wikipedia.org/api/rest_v1/page/summary/Yankee_Stadium\")"
+      "Bash(curl -s -A \"Mozilla/5.0 \\(compatible; research-bot/1.0\\)\" \"https://en.wikipedia.org/api/rest_v1/page/summary/Yankee_Stadium\")",
+      "Bash(where python *)",
+      "Bash(where python3 *)",
+      "Bash(where py *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(Get-ChildItem \"C:\\\\Program Files\" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match \"[Dd]ocker|[Rr]ancher|[Pp]odman\" } | Format-Table FullName; Get-ChildItem \"C:\\\\Users\\\\Sam\\\\AppData\\\\Local\" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match \"[Dd]ocker|[Rr]ancher|[Pp]odman\" } | Format-Table FullName; Write-Output \"---WSL---\"; wsl --list --verbose 2>&1 | Out-String)",
+      "PowerShell(cmd /c \"python preprocessing2.py > preprocessing_run.log 2>&1 && python train_model2.py > train_model_run.log 2>&1\")",
+      "PowerShell(cmd /c \"python preprocessing2.py --enable_pitchtype_statcast_v2 > preprocessing_run.log 2>&1 && python train_model2.py --use_per_class_gate_logit > train_model_run.log 2>&1\")",
+      "Bash(git --no-pager diff --stat -- app/main.py data_pipeline2.py requirements.txt Dockerfile)"
     ]
   }
 }

@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from . import model_loader
 from .data import get_app_data, load_all
 from .inference import run_prediction
 from .search import get_stadiums, search_players
@@ -22,6 +23,8 @@ STATIC_DIR = os.environ.get("STATIC_DIR", "static")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pull the latest model bundle from S3 (no-op in local dev) before loading.
+    model_loader.sync_from_s3()
     load_all()
     yield
 

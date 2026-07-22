@@ -18,7 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY train_model2.py .
 
-# Copy model artifacts and preprocessed data
+# Seed/fallback model artifacts baked into the image. The live model is synced
+# from S3 at runtime (app/model_loader.sync_from_s3); these COPYs only provide a
+# starting model so the container can serve before the first S3 sync completes.
 COPY model_artifacts/ ./model_artifacts/
 COPY preprocessed/ ./preprocessed/
 
