@@ -1,0 +1,73 @@
+name: Daily model retrain
+
+on:
+  schedule:
+    # 08:00 UTC = 04:00 ET (EDT) / 03:00 ET (EST).
+    # Runs before the VM's 5am restart so a fresh model is waiting in S3.
+    - cron: '0 8 * * *'
+  workflow_dispatch: {}   # manual "Run workflow" button in the Actions tab
+
+concurrency:
+  group: retrain
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240   # 4 hr ceiling; a normal run is ~1 hr
+
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      MODEL_S3_BUCKET: ${{ secrets.MODEL_S3_BUCKET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compute yesterday's date
+        run: |
+          echo "END_DT=$(date -u -d 'yesterday' +%Y-%m-%d)" >> $GITHUB_ENV
+          echo "RUN_STAMP=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_ENV
+
+      - name: Run data pipeline
+        run: python data_pipeline2.py
+
+      - name: Train model
+        run: python train_model2.py
+
+      - name: Upload versioned copy to S3
+        if: ${{ success() }}
+        run: |
+          aws s3 sync ./model_artifacts/ s3://${MODEL_S3_BUCKET}/models/${RUN_STAMP}/
+          aws s3 sync ./preprocessed/  s3://${MODEL_S3_BUCKET}/models/${RUN_STAMP}/
+
+      - name: Promote to latest
+        if: ${{ success() }}
+        run: |
+          # Write everything to latest/ first, then overwrite the manifest LAST.
+          # The VM only cares about the manifest ETag, so it never sees a
+          # half-written model.
+          aws s3 sync ./model_artifacts/ s3://${MODEL_S3_BUCKET}/models/latest/ --exclude "manifest.json"
+          aws s3 sync ./preprocessed/  s3://${MODEL_S3_BUCKET}/models/latest/ --exclude "manifest.json"
+          cat > manifest.json <<EOF
+          {
+            "run_stamp": "${RUN_STAMP}",
+            "end_dt": "${END_DT}",
+            "git_sha": "${GITHUB_SHA}",
+            "promoted_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          aws s3 cp manifest.json s3://${MODEL_S3_BUCKET}/models/latest/manifest.json
