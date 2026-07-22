@@ -84,7 +84,18 @@ def load_all() -> AppData:
     print(f"[startup] Loading data from preprocessed={pre!r}, artifacts={art!r}")
 
     # --- Metadata + config ---
-    meta = json.load(open(os.path.join(pre, "metadata.json")))
+    # metadata.json defines the feature order, categorical columns and vocab
+    # sizes the model was built with, so it must come from the same bundle as
+    # model.pt. Training copies it into model_artifacts/ next to the checkpoint,
+    # and model_loader routes the S3 copy there too — preprocessed/metadata.json
+    # is never refreshed by a sync and goes stale (it is whatever was baked into
+    # the image). Prefer the artifact copy; fall back only for local dev runs
+    # that never produced one.
+    meta_path = os.path.join(art, "metadata.json")
+    if not os.path.exists(meta_path):
+        meta_path = os.path.join(pre, "metadata.json")
+    print(f"[startup] Reading metadata from {meta_path!r}")
+    meta = json.load(open(meta_path))
     train_config = json.load(open(os.path.join(art, "train_config.json")))
 
     feature_list_ordered = meta["features"]["feature_list_ordered"]
@@ -190,6 +201,31 @@ def load_all() -> AppData:
     dropout = train_config.get("DROPOUT", 0.2)
     num_pt = len(pt_cols)
 
+    state = torch.load(os.path.join(art, "model.pt"), map_location="cpu", weights_only=True)
+
+    # The checkpoint is the authority on embedding sizes: each categorical column
+    # has an `embeddings.<col>.weight` of shape [vocab_size, emb_dim]. Sizing from
+    # the tensors themselves means a retrain that adds players can never desync
+    # the architecture from the weights, whatever metadata.json says.
+    ckpt_vocab_sizes = {
+        col: int(state[f"embeddings.{col}.weight"].shape[0])
+        for col in cat_cols
+        if f"embeddings.{col}.weight" in state
+    }
+    for col, size in ckpt_vocab_sizes.items():
+        declared = vocab_sizes.get(col)
+        if declared is not None and int(declared) != size:
+            print(f"[startup] WARNING: metadata vocab size for {col!r} is {declared}, "
+                  f"checkpoint has {size}; using the checkpoint.")
+    vocab_sizes = {**vocab_sizes, **ckpt_vocab_sizes}
+
+    missing = [c for c in cat_cols if c not in vocab_sizes]
+    if missing:
+        raise RuntimeError(
+            f"No vocab size for categorical columns {missing} in either "
+            f"{meta_path} or the checkpoint's embedding weights."
+        )
+
     model = tm.PerClassGateLogitHybridModel(
         cat_cols=cat_cols,
         num_numeric=len(num_cols),
@@ -200,7 +236,6 @@ def load_all() -> AppData:
         num_pt_statcast_cols=num_pt,
         league_logodds=league_logodds,
     )
-    state = torch.load(os.path.join(art, "model.pt"), map_location="cpu", weights_only=True)
     model.load_state_dict(state)
     model.eval()
     print("[startup] Model loaded successfully")
