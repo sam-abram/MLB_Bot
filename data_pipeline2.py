@@ -22,7 +22,11 @@ except ImportError as e:
 # Config (edit these)
 # =========================
 START_DT = "2023-03-30"   # inclusive, YYYY-MM-DD
-END_DT = os.environ.get("END_DT", "2026-07-22")  # inclusive, YYYY-MM-DD
+# Defaults to yesterday (UTC) so an unset END_DT never pins the pipeline to a
+# stale date. Override via the END_DT env var.
+END_DT = os.environ.get(
+    "END_DT", (datetime.utcnow().date() - timedelta(days=1)).isoformat()
+)  # inclusive, YYYY-MM-DD
 CHUNK_DAYS = 7            # inclusive chunk length
 # data_pipeline2.py (top config)
 OUTPUT_CSV = "statcast_pitches.csv"
