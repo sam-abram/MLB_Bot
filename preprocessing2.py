@@ -43,8 +43,8 @@ INPUT_CSV = "statcast_pitches.csv"  # override via CLI
 OUTPUT_FORMAT = "parquet"  # or "csv"
 
 # Split strategy: train <= TRAIN_END_DATE, val <= VAL_END_DATE, else test
-TRAIN_END_DATE = "2025-08-31"
-VAL_END_DATE = "2025-09-14"
+TRAIN_END_DATE = os.environ.get("TRAIN_END_DATE", (__import__("datetime").date.today() - __import__("datetime").timedelta(days=21)).isoformat())
+VAL_END_DATE = os.environ.get("VAL_END_DATE", (__import__("datetime").date.today() - __import__("datetime").timedelta(days=7)).isoformat())
 
 # Tendency smoothing / shrink parameters
 # =========================
