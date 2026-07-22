@@ -45,6 +45,9 @@ jobs:
       - name: Run data pipeline
         run: python data_pipeline2.py
 
+      - name: Preprocess
+        run: python preprocessing2.py
+
       - name: Train model
         run: python train_model2.py
 
