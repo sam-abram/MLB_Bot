@@ -1232,24 +1232,32 @@ def _stream_y_w(
     raise ValueError(f"Unsupported file_format={file_format}")
 
 
+@torch.no_grad()
 def compute_distribution_scorecard(
     model: nn.Module,
     train_path: str,
-    test_path: str,
     file_format: str,
     num_classes: int,
     test_loader: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
     device: str,
     weight_col_for_baselines: Optional[str],
-) -> Dict[str, float]:
+    batter_col_idx: int,
+    num_batters: int,
+) -> Optional[Dict[str, float]]:
     """
-    Computes:
+    Computes (on the split behind test_loader):
       - uniform_logloss
       - base_rate_logloss (train freq baseline evaluated on test)
       - model_test_logloss (proper logloss on test)
       - pct_better_than_base_rates (positive means model beats base rates)
       - delta_logloss_vs_base_rates (base - model; positive means better)
       - majority_class_accuracy (always predicting train-majority class, measured on test)
+      - uncertainty on the delta, from paired per-PA differences
+          d_i = -log p_base(y_i) - (-log p_model(y_i)):
+          se_delta_iid, se_delta_cluster_batter (cluster-robust by batter; used for the CI),
+          z_score, delta_ci95_low/high, pct_better_ci95_low/high,
+          prob_ratio_geo = exp(delta) (geometric-mean p_model(y) / p_base(y))
+    Returns None if the split is empty.
     """
     K = int(num_classes)
     eps = 1e-12
@@ -1272,29 +1280,76 @@ def compute_distribution_scorecard(
     p = p / p.sum()
 
     maj = int(np.argmax(p))
+    neg_log_p = torch.tensor(-np.log(p), dtype=torch.float64, device=device)
 
-    # --- base-rate logloss on test + majority acc on test ---
-    loss_sum = 0.0
+    # --- paired base-rate vs model logloss on test (one pass, same PAs) ---
+    model.eval()
+    crit = nn.CrossEntropyLoss(reduction="none")  # no class weights; proper logloss
+
+    n_eval = 0
     w_sum = 0.0
+    w2_sum = 0.0
+    base_sum = 0.0
+    model_sum = 0.0
+    d_sum = 0.0
+    d2_sum = 0.0
     maj_correct = 0.0
+    cluster_d = torch.zeros(num_batters, dtype=torch.float64, device=device)
+    cluster_w = torch.zeros(num_batters, dtype=torch.float64, device=device)
 
-    for y, w in _stream_y_w(test_path, file_format, weight_col_for_baselines):
-        w = w.astype(np.float64, copy=False)
-        w_sum += float(w.sum())
-        loss_sum += float((-np.log(p[y]) * w).sum())
-        maj_correct += float(((y == maj).astype(np.float64) * w).sum())
+    for x_cat, x_num, y, w in test_loader:
+        if y.numel() == 0:
+            continue
+
+        x_cat = x_cat.to(device, non_blocking=True)
+        x_num = x_num.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        w = w.to(device, non_blocking=True).double()
+
+        model_loss = crit(model(x_cat, x_num), y).double()
+        base_loss = neg_log_p[y]
+        d = base_loss - model_loss  # positive => model better on this PA
+
+        n_eval += int(y.numel())
+        w_sum += float(w.sum().item())
+        w2_sum += float((w * w).sum().item())
+        base_sum += float((base_loss * w).sum().item())
+        model_sum += float((model_loss * w).sum().item())
+        d_sum += float((d * w).sum().item())
+        d2_sum += float((d * d * w).sum().item())
+        maj_correct += float(((y == maj).double() * w).sum().item())
+
+        b = torch.clamp(x_cat[:, batter_col_idx], min=0, max=num_batters - 1)
+        cluster_d += torch.bincount(b, weights=d * w, minlength=num_batters)
+        cluster_w += torch.bincount(b, weights=w, minlength=num_batters)
 
     if w_sum <= 0:
-        raise ValueError("Test split appears empty (cannot compute scorecard).")
+        return None
 
-    base_rate_logloss = float(loss_sum / w_sum)
+    base_rate_logloss = float(base_sum / w_sum)
+    model_test_logloss = float(model_sum / w_sum)
     majority_class_accuracy = float(maj_correct / w_sum)
 
-    # --- model logloss on test (proper scoring rule) ---
-    model_test_logloss = float(evaluate_logloss_only(model, test_loader, device))
-
-    delta = float(base_rate_logloss - model_test_logloss)  # positive => model better
+    delta = float(d_sum / w_sum)  # = base - model; positive => model better
     pct_better = float(100.0 * delta / max(base_rate_logloss, eps))
+
+    # iid SE: weighted variance of d over the effective sample size
+    var_d = max(d2_sum / w_sum - delta ** 2, 0.0)
+    n_eff = w_sum ** 2 / max(w2_sum, eps)
+    se_iid = float(math.sqrt(var_d / n_eff))
+
+    # Cluster-robust SE by batter: a batter's PAs share prediction errors, so they
+    # are not independent draws. Small-sample factor G/(G-1).
+    used = cluster_w > 0
+    G = int(used.sum().item())
+    resid = (cluster_d - cluster_w * delta)[used]
+    if G > 1:
+        se_cluster = float(math.sqrt(G / (G - 1) * float((resid ** 2).sum().item())) / w_sum)
+    else:
+        se_cluster = float("nan")
+
+    ci_low = delta - 1.96 * se_cluster
+    ci_high = delta + 1.96 * se_cluster
 
     return {
         "uniform_logloss": uniform_logloss,
@@ -1303,7 +1358,119 @@ def compute_distribution_scorecard(
         "delta_logloss_vs_base_rates": delta,
         "pct_better_than_base_rates": pct_better,
         "majority_class_accuracy": majority_class_accuracy,
+        "n_eval": n_eval,
+        "num_batter_clusters": G,
+        "se_delta_iid": se_iid,
+        "se_delta_cluster_batter": se_cluster,
+        "z_score": float(delta / se_cluster) if se_cluster > 0 else float("nan"),
+        "delta_ci95_low": float(ci_low),
+        "delta_ci95_high": float(ci_high),
+        "pct_better_ci95_low": float(100.0 * ci_low / max(base_rate_logloss, eps)),
+        "pct_better_ci95_high": float(100.0 * ci_high / max(base_rate_logloss, eps)),
+        "prob_ratio_geo": float(math.exp(delta)),
     }
+
+
+def _print_scorecard(split_name: str, sc: Optional[Dict[str, float]]) -> None:
+    if sc is None:
+        print(f"[SCORECARD] {split_name} split: N/A (empty split)")
+        return
+    print(f"[SCORECARD] Evaluated on {split_name} split (n={sc['n_eval']:,} PAs, {sc['num_batter_clusters']:,} batters)")
+    print("[SCORECARD] Uniform logloss:        {:.6f}".format(sc["uniform_logloss"]))
+    print("[SCORECARD] Base-rate logloss:      {:.6f}".format(sc["base_rate_logloss"]))
+    print("[SCORECARD] Model logloss:          {:.6f}".format(sc["model_test_logloss"]))
+    print("[SCORECARD] Delta vs base-rates:     {:+.6f} (SE {:.6f} iid, {:.6f} clustered by batter)".format(
+        sc["delta_logloss_vs_base_rates"], sc["se_delta_iid"], sc["se_delta_cluster_batter"]))
+    print("[SCORECARD] % better than base:     {:+.2f}% (95% CI {:+.2f}% to {:+.2f}%, z={:.1f})".format(
+        sc["pct_better_than_base_rates"], sc["pct_better_ci95_low"], sc["pct_better_ci95_high"], sc["z_score"]))
+    print("[SCORECARD] Geo-mean p(y) ratio:    {:.4f}".format(sc["prob_ratio_geo"]))
+    print("[SCORECARD] Majority-class acc:     {:.4f}".format(sc["majority_class_accuracy"]))
+
+
+@torch.no_grad()
+def compute_calibration(
+    model: nn.Module,
+    dataset,
+    device: str,
+    class_names: List[str],
+    n_bins: int = 10,
+) -> Optional[Dict[str, object]]:
+    """
+    Per-class reliability on a split. For each outcome k, PAs are sorted by predicted
+    p_k into n_bins equal-count bins, and each bin's mean predicted p_k is compared
+    with the observed rate of k in that bin.
+      ece_pp: count-weighted mean |pred - obs| across bins, in percentage points
+      p10/p90: spread of predicted p_k across matchups
+      lift: observed rate in the top bin / observed rate in the bottom bin
+    Returns None if the split is empty.
+    """
+    model.eval()
+    all_p = []
+    all_y = []
+    for x_cat, x_num, y, w in dataset:
+        if y.numel() == 0:
+            continue
+        x_cat = x_cat.to(device, non_blocking=True)
+        x_num = x_num.to(device, non_blocking=True)
+        all_p.append(torch.softmax(model(x_cat, x_num), dim=1).cpu())
+        all_y.append(y.cpu())
+    if not all_p:
+        return None
+    p_all = torch.cat(all_p, dim=0).double().numpy()  # (N, K)
+    y_all = torch.cat(all_y, dim=0).numpy()  # (N,)
+    n = int(len(y_all))
+
+    stats: Dict[str, object] = {"n": n, "n_bins": int(n_bins)}
+    eces = []
+    for k, name in enumerate(class_names):
+        p_k = p_all[:, k]
+        hit = (y_all == k).astype(np.float64)
+        order = np.argsort(p_k, kind="stable")
+
+        bins = []
+        abs_err_sum = 0.0
+        for idx in np.array_split(order, n_bins):
+            if idx.size == 0:
+                continue
+            pred = float(p_k[idx].mean())
+            obs = float(hit[idx].mean())
+            bins.append({"n": int(idx.size), "pred": pred, "obs": obs})
+            abs_err_sum += idx.size * abs(pred - obs)
+
+        ece_pp = 100.0 * abs_err_sum / n
+        eces.append(ece_pp)
+        bottom, top = bins[0], bins[-1]
+        stats[name] = {
+            "mean_pred": float(p_k.mean()),
+            "obs_rate": float(hit.mean()),
+            "p10": float(np.percentile(p_k, 10)),
+            "p90": float(np.percentile(p_k, 90)),
+            "ece_pp": float(ece_pp),
+            "bottom_bin_pred": bottom["pred"],
+            "bottom_bin_obs": bottom["obs"],
+            "top_bin_pred": top["pred"],
+            "top_bin_obs": top["obs"],
+            "lift": float(top["obs"] / bottom["obs"]) if bottom["obs"] > 0 else float("nan"),
+            "bins": bins,
+        }
+    stats["_overall"] = {"ece_pp_mean": float(np.mean(eces))}
+    return stats
+
+
+def _print_calibration(split_name: str, cal: Optional[Dict[str, object]], class_names: List[str]) -> None:
+    if cal is None:
+        print(f"[CALIBRATION] {split_name} split: N/A (empty split)")
+        return
+    print(f"[CALIBRATION] {split_name} split (n={cal['n']:,} PAs, {cal['n_bins']} equal-count bins per outcome)")
+    print(f"  {'Class':<6s} | {'Pred':>7s} {'Obs':>7s} | {'p10':>7s} {'p90':>7s} | "
+          f"{'Bot pred':>8s} {'Bot obs':>8s} {'Top pred':>8s} {'Top obs':>8s} {'Lift':>6s} | {'ECE pp':>7s}")
+    print(f"  {'-' * 102}")
+    for name in class_names:
+        c = cal[name]
+        print(f"  {name:<6s} | {c['mean_pred']:>7.2%} {c['obs_rate']:>7.2%} | {c['p10']:>7.2%} {c['p90']:>7.2%} | "
+              f"{c['bottom_bin_pred']:>8.2%} {c['bottom_bin_obs']:>8.2%} {c['top_bin_pred']:>8.2%} {c['top_bin_obs']:>8.2%} "
+              f"{c['lift']:>6.2f} | {c['ece_pp']:>7.3f}")
+    print(f"  Mean ECE across outcomes: {cal['_overall']['ece_pp_mean']:.3f} pp")
 
 # -----------------------------
 # Main
@@ -1575,25 +1742,41 @@ def main() -> None:
     # --- Distribution scorecard (proper probability evaluation) ---
     # Evaluate scorecard on VAL split (the primary evaluation window)
     baseline_weight_col = WEIGHT_COL if (WEIGHT_COL in set(split_columns["train"]) and WEIGHT_COL in set(split_columns["val"])) else None
+    batter_col_idx = cat_cols.index("batter_id")
+    num_batters = vocab_sizes["batter_id"]
 
     scorecard = compute_distribution_scorecard(
         model=model,
         train_path=split_paths["train"],
-        test_path=split_paths["val"],
         file_format=file_format,
         num_classes=num_classes,
         test_loader=val_loader,
         device=DEVICE,
         weight_col_for_baselines=baseline_weight_col,
+        batter_col_idx=batter_col_idx,
+        num_batters=num_batters,
     )
+    if scorecard is None:
+        raise ValueError("Val split appears empty (cannot compute scorecard).")
 
-    print("[SCORECARD] Evaluated on VAL split (primary eval window)")
-    print("[SCORECARD] Uniform logloss:        {:.6f}".format(scorecard["uniform_logloss"]))
-    print("[SCORECARD] Base-rate logloss:      {:.6f}".format(scorecard["base_rate_logloss"]))
-    print("[SCORECARD] Model val logloss:      {:.6f}".format(scorecard["model_test_logloss"]))
-    print("[SCORECARD] Delta vs base-rates:     {:+.6f}".format(scorecard["delta_logloss_vs_base_rates"]))
-    print("[SCORECARD] % better than base:     {:+.2f}%".format(scorecard["pct_better_than_base_rates"]))
-    print("[SCORECARD] Majority-class acc:     {:.4f}".format(scorecard["majority_class_accuracy"]))
+    # Test split is the clean holdout (never used for early stopping); it may be
+    # empty in the offseason, so it is reported as N/A rather than failing.
+    scorecard_test = compute_distribution_scorecard(
+        model=model,
+        train_path=split_paths["train"],
+        file_format=file_format,
+        num_classes=num_classes,
+        test_loader=test_loader,
+        device=DEVICE,
+        weight_col_for_baselines=baseline_weight_col,
+        batter_col_idx=batter_col_idx,
+        num_batters=num_batters,
+    )
+    calibration_test = compute_calibration(model, test_loader, DEVICE, label_set_ordered)
+
+    _print_scorecard("VAL", scorecard)
+    _print_scorecard("TEST", scorecard_test)
+    _print_calibration("TEST", calibration_test, label_set_ordered)
 
     print("-" * 72)
     print(f"Best val loss: {best_val_loss:.6f} (epoch {best_epoch}), best val acc: {best_val_acc:.4f}")
@@ -1672,6 +1855,9 @@ def main() -> None:
         "best_val_accuracy_epoch": float(best_val_metrics.accuracy) if best_val_metrics else None,
         "final_test_loss": float(test_metrics.loss),
         "final_test_accuracy": float(test_metrics.accuracy),
+        "scorecard_val": scorecard,
+        "scorecard_test": scorecard_test,
+        "calibration_test": calibration_test,
         "history": history,  # per-epoch train/val metrics
         "timestamp": _now_str(),
     }
